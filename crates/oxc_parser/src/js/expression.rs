@@ -1550,8 +1550,10 @@ impl<'a, C: Config> ParserImpl<'a, C> {
             return self.parse_yield_expression();
         }
         // `() => {}`, `(x) => {}`
-        if let Some(mut arrow_expr) = self
-            .try_parse_parenthesized_arrow_function_expression(allow_return_type_in_arrow_function)
+        if matches!(self.cur_kind(), Kind::LParen | Kind::LAngle | Kind::Async)
+            && let Some(mut arrow_expr) = self.try_parse_parenthesized_arrow_function_expression(
+                allow_return_type_in_arrow_function,
+            )
         {
             if let Some(comments) = no_side_effects_comments
                 && let Expression::ArrowFunctionExpression(func) = &mut arrow_expr
@@ -1562,8 +1564,10 @@ impl<'a, C: Config> ParserImpl<'a, C> {
             return arrow_expr;
         }
         // `async x => {}`
-        if let Some(mut arrow_expr) = self
-            .try_parse_async_simple_arrow_function_expression(allow_return_type_in_arrow_function)
+        if self.at(Kind::Async)
+            && let Some(mut arrow_expr) = self.try_parse_async_simple_arrow_function_expression(
+                allow_return_type_in_arrow_function,
+            )
         {
             if let Some(comments) = no_side_effects_comments
                 && let Expression::ArrowFunctionExpression(func) = &mut arrow_expr
@@ -1608,8 +1612,11 @@ impl<'a, C: Config> ParserImpl<'a, C> {
             );
         }
 
-        let mut expr =
-            self.parse_conditional_expression_rest(start, lhs, allow_return_type_in_arrow_function);
+        let mut expr = if self.at(Kind::Question) {
+            self.parse_conditional_expression_rest(start, lhs, allow_return_type_in_arrow_function)
+        } else {
+            lhs
+        };
 
         if let Some(comments) = no_side_effects_comments {
             self.apply_no_side_effects_comments_to_function(comments, &mut expr);
