@@ -353,7 +353,10 @@ impl AliasingState {
                     } else {
                         entry.kind
                     },
-                    may_call: entry.may_call,
+                    // Capturing a value into another value mutates the target,
+                    // but does not call it. Calls are represented by `Apply`
+                    // effects and reach the callback independently.
+                    may_call: entry.may_call && edge.kind != EdgeKind::Capture,
                 });
             }
 

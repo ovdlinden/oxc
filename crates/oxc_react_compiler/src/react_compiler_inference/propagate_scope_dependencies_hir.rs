@@ -1069,6 +1069,15 @@ fn get_assumed_invoked_functions_impl(
                 // Unlike the TS implementation, functions passed to JSX are not assumed
                 // invoked: event handlers run after render, if at all, so their property
                 // reads must not become cache guards that run during render.
+                InstructionValue::FinishMemoize { decl, .. } => {
+                    // Unlike the TS implementation, JSX does not make callbacks assumed-
+                    // invoked above. A function preserved by `useCallback` still needs its
+                    // optional property reads hoisted so they can match the dependency list
+                    // that React evaluates during render.
+                    if let Some(entry) = temporaries.get(&decl.identifier) {
+                        hoistable.insert(entry.0);
+                    }
+                }
                 InstructionValue::FunctionExpression { lowered_func, .. } => {
                     // Recursively traverse into other function expressions
                     // TS passes the shared temporaries map to the recursive call

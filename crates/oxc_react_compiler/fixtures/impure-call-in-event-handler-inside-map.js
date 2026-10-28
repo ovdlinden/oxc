@@ -52,6 +52,20 @@ export function HelperCalledOutsideMap({ onPick }) {
   );
 }
 
+// Initializing a captured local after creating a helper mutates the closures
+// that capture it, but does not call those closures during render.
+export function HandlerCallsHelperCapturingLaterLocal({ onPick, items }) {
+  function readItems() {
+    onPick(itemsForHandler);
+  }
+  function handlePick() {
+    readItems();
+    onPick(Date.now());
+  }
+  const itemsForHandler = getItems(items);
+  return <Dialog onPick={handlePick} />;
+}
+
 // Calls from the map callback itself still execute during render.
 export function ImpureCallInMapCallback() {
   return <div>{ITEMS.map((item) => Date.now())}</div>;

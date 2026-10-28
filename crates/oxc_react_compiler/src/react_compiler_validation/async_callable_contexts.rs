@@ -3,7 +3,9 @@ use std::rc::Rc;
 use oxc_span::Span;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::validate_locals_not_reassigned_after_render::no_alias_callback_parameters;
+use super::validate_locals_not_reassigned_after_render::{
+    collect_method_names, fallback_method_name, no_alias_callback_parameters,
+};
 use crate::react_compiler_hir::environment::Environment;
 use crate::react_compiler_hir::visitors::{
     each_instruction_value_lvalue, each_instruction_value_operand, each_terminal_operand,
@@ -919,6 +921,7 @@ impl CallableState {
         &self,
         instruction: &InstructionValue<'_>,
         env: &Environment<'_>,
+        fallback_method: Option<&str>,
         require_result_flow: bool,
     ) -> Values {
         let args = match instruction {
@@ -937,7 +940,13 @@ impl CallableState {
                 + 1
         });
         let mut result = Values::default();
-        for index in no_alias_callback_parameters(instruction, env, require_result_flow, count) {
+        for index in no_alias_callback_parameters(
+            instruction,
+            env,
+            fallback_method,
+            require_result_flow,
+            count,
+        ) {
             if let Some(values) = arguments.elements.get(&Some(index.to_string())) {
                 result.extend(values);
             }
@@ -1968,6 +1977,7 @@ pub(super) fn infer_async_callable_contexts(
     function_returns: &FxHashMap<IdentifierId, ReturnedCallables>,
     env: &Environment<'_>,
 ) -> AsyncCallables {
+    let method_names = collect_method_names(func);
     let mut result = AsyncCallables {
         identifiers: FxHashSet::default(),
         invocations: FxHashMap::default(),
@@ -2036,10 +2046,16 @@ pub(super) fn infer_async_callable_contexts(
                 }
                 let mut invocations = Vec::new();
                 let (arguments, _) = state.call_arguments(instruction);
+                let fallback_method = fallback_method_name(&instruction.value, &method_names);
                 let calls: Vec<_> = [
                     Call { callees: state.invoked(&instruction.value), arguments: Some(arguments) },
                     Call {
-                        callees: state.invoked_callbacks(&instruction.value, env, false),
+                        callees: state.invoked_callbacks(
+                            &instruction.value,
+                            env,
+                            fallback_method.as_ref().map(|name| name.as_str()),
+                            false,
+                        ),
                         arguments: state.callback_arguments(&instruction.value, env),
                     },
                 ]
@@ -2064,7 +2080,12 @@ pub(super) fn infer_async_callable_contexts(
                 } else {
                     result.returned.calls.insert(instruction_id, calls);
                 }
-                let returning = state.invoked_callbacks(&instruction.value, env, true);
+                let returning = state.invoked_callbacks(
+                    &instruction.value,
+                    env,
+                    fallback_method.as_ref().map(|name| name.as_str()),
+                    true,
+                );
                 let mut identifiers = returning.identities;
                 identifiers.extend(returning.contexts.keys().copied());
                 if identifiers.is_empty() {

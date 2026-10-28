@@ -1,0 +1,90 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/synchronous-collection-callback-reassigns-render-local.tsx
+---
+import { c as _c } from "react/compiler-runtime";
+import React from "react";
+function Component(t0) {
+	const $ = _c(21);
+	const { children, items } = t0;
+	let maxLength;
+	let t1;
+	if ($[0] !== items) {
+		maxLength = 0;
+		t1 = items.map((item) => {
+			maxLength = Math.max(maxLength, item.label.length);
+			return item;
+		});
+		$[0] = items;
+		$[1] = maxLength;
+		$[2] = t1;
+	} else {
+		maxLength = $[1];
+		t1 = $[2];
+	}
+	const mapped = t1;
+	let firstMatch;
+	let t2;
+	if ($[3] !== items) {
+		firstMatch = null;
+		t2 = items && items.some((item_0) => {
+			firstMatch = item_0.matches ? item_0 : null;
+			return item_0.matches;
+		});
+		$[3] = items;
+		$[4] = firstMatch;
+		$[5] = t2;
+	} else {
+		firstMatch = $[4];
+		t2 = $[5];
+	}
+	const hasMatch = t2;
+	let offset;
+	let t3;
+	if ($[6] !== children) {
+		offset = 0;
+		t3 = React.Children.map(children, (child) => {
+			offset = offset + child.props.children.length;
+			return child;
+		});
+		$[6] = children;
+		$[7] = offset;
+		$[8] = t3;
+	} else {
+		offset = $[7];
+		t3 = $[8];
+	}
+	const highlighted = t3;
+	let optionalCount;
+	let t4;
+	if ($[9] !== items) {
+		optionalCount = 0;
+		t4 = items?.map((item_1) => {
+			optionalCount++;
+			return item_1;
+		});
+		$[9] = items;
+		$[10] = optionalCount;
+		$[11] = t4;
+	} else {
+		optionalCount = $[10];
+		t4 = $[11];
+	}
+	const optionalMapped = t4;
+	let t5;
+	if ($[12] !== firstMatch || $[13] !== hasMatch || $[14] !== highlighted || $[15] !== mapped || $[16] !== maxLength || $[17] !== offset || $[18] !== optionalCount || $[19] !== optionalMapped) {
+		t5 = <div data-max={maxLength} data-match={firstMatch}>{hasMatch}{mapped}{highlighted}{offset}{optionalCount}{optionalMapped}</div>;
+		$[12] = firstMatch;
+		$[13] = hasMatch;
+		$[14] = highlighted;
+		$[15] = mapped;
+		$[16] = maxLength;
+		$[17] = offset;
+		$[18] = optionalCount;
+		$[19] = optionalMapped;
+		$[20] = t5;
+	} else {
+		t5 = $[20];
+	}
+	return t5;
+}

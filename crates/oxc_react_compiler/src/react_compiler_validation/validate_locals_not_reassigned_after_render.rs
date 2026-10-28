@@ -11,18 +11,21 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_index::IndexSlice;
+use oxc_str::Ident;
 use smallvec::smallvec;
 
 use super::async_callable_contexts::{ReturnedCallables, infer_async_callable_contexts};
 use crate::diagnostics;
 use crate::react_compiler_hir::environment::Environment;
+use crate::react_compiler_hir::object_shape::FunctionSignature;
 use crate::react_compiler_hir::type_config::AliasingEffectConfig;
 use crate::react_compiler_hir::visitors::{
     PlaceList, each_instruction_lvalue_ids, each_instruction_value_operand, each_terminal_operand,
 };
 use crate::react_compiler_hir::{
     BlockId, Effect, FunctionId, HirFunction, Identifier, IdentifierId, IdentifierName,
-    InstructionId, InstructionKind, InstructionValue, ParamPattern, Place, Terminal,
+    InstructionId, InstructionKind, InstructionValue, ParamPattern, Place, PropertyLiteral,
+    Terminal,
 };
 
 type ContextValues = FxHashMap<IdentifierId, FxHashSet<IdentifierId>>;
@@ -180,7 +183,11 @@ fn record_async_reassignment(
 
 /// Operands through which a reassigning function can propagate. Calls with a
 /// no-alias signature only propagate through their callee or receiver.
-fn each_reassigning_operand(value: &InstructionValue<'_>, env: &Environment<'_>) -> PlaceList {
+fn each_reassigning_operand(
+    value: &InstructionValue<'_>,
+    env: &Environment<'_>,
+    fallback_method: Option<&str>,
+) -> PlaceList {
     match value {
         InstructionValue::CallExpression { callee, .. }
             if env.has_no_alias_signature(callee.identifier) =>
@@ -188,7 +195,9 @@ fn each_reassigning_operand(value: &InstructionValue<'_>, env: &Environment<'_>)
             smallvec![*callee]
         }
         InstructionValue::MethodCall { receiver, property, .. }
-            if env.has_no_alias_signature(property.identifier) =>
+            if env.has_no_alias_signature(property.identifier)
+                || (function_signature(env, property.identifier).is_none()
+                    && fallback_method.is_some_and(is_synchronous_callback_method)) =>
         {
             smallvec![*receiver, *property]
         }
@@ -207,6 +216,7 @@ fn each_reassigning_operand(value: &InstructionValue<'_>, env: &Environment<'_>)
 pub(super) fn no_alias_callback_parameters(
     value: &InstructionValue<'_>,
     env: &Environment<'_>,
+    fallback_method: Option<&str>,
     require_result_flow: bool,
     argument_count: usize,
 ) -> Vec<usize> {
@@ -216,9 +226,21 @@ pub(super) fn no_alias_callback_parameters(
         _ => return Vec::new(),
     };
 
-    let ty = &env.types[env.identifiers[signature_identifier].type_];
-    let Some(signature) = env.get_function_signature(ty).ok().flatten() else {
-        return Vec::new();
+    let Some(signature) = function_signature(env, signature_identifier) else {
+        // Unlike the TS implementation, Oxc does not have a type checker or a
+        // runtime module evaluator to recover collection types from TypeScript
+        // props and third-party APIs. Treat the standard synchronous iterator
+        // method names as no-alias when their receiver's shape is unavailable.
+        if fallback_method
+            .filter(|method| {
+                is_synchronous_callback_method(method)
+                    && (!require_result_flow || callback_result_flows_to_return(method))
+            })
+            .is_none()
+        {
+            return Vec::new();
+        }
+        return (argument_count != 0).then_some(0).into_iter().collect();
     };
     if !signature.no_alias {
         return Vec::new();
@@ -272,6 +294,93 @@ pub(super) fn no_alias_callback_parameters(
         }
     }
     operands
+}
+
+fn function_signature<'a>(
+    env: &'a Environment<'_>,
+    identifier: IdentifierId,
+) -> Option<&'a FunctionSignature> {
+    let ty = &env.types[env.identifiers[identifier].type_];
+    env.get_function_signature(ty).ok().flatten()
+}
+
+fn is_synchronous_callback_method(method: &str) -> bool {
+    matches!(
+        method,
+        "map" | "flatMap" | "forEach" | "filter" | "every" | "some" | "find" | "findIndex"
+    )
+}
+
+fn callback_result_flows_to_return(method: &str) -> bool {
+    matches!(method, "map" | "flatMap")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MethodName<'a> {
+    Known(Ident<'a>),
+    Ambiguous,
+}
+
+pub(super) fn collect_method_names<'a>(
+    func: &HirFunction<'a>,
+) -> FxHashMap<IdentifierId, Ident<'a>> {
+    let mut names = FxHashMap::default();
+    let mut copies: FxHashMap<IdentifierId, Vec<IdentifierId>> = FxHashMap::default();
+    let mut pending = VecDeque::new();
+
+    for instr in &func.instructions {
+        match &instr.value {
+            InstructionValue::PropertyLoad { property: PropertyLiteral::String(name), .. } => {
+                names.insert(instr.lvalue.identifier, MethodName::Known(*name));
+                pending.push_back(instr.lvalue.identifier);
+            }
+            InstructionValue::LoadLocal { place, .. } => {
+                copies.entry(place.identifier).or_default().push(instr.lvalue.identifier);
+            }
+            InstructionValue::StoreLocal { lvalue, value, .. } => {
+                copies.entry(value.identifier).or_default().push(lvalue.place.identifier);
+            }
+            _ => {}
+        }
+    }
+
+    while let Some(source) = pending.pop_front() {
+        let Some(source_name) = names.get(&source).copied() else { continue };
+        for &target in copies.get(&source).into_iter().flatten() {
+            let next = match (names.get(&target).copied(), source_name) {
+                (None, name) => name,
+                (Some(MethodName::Known(current)), MethodName::Known(incoming))
+                    if current == incoming =>
+                {
+                    continue;
+                }
+                (Some(MethodName::Ambiguous), _) => continue,
+                _ => MethodName::Ambiguous,
+            };
+            names.insert(target, next);
+            pending.push_back(target);
+        }
+    }
+
+    names
+        .into_iter()
+        .filter_map(|(identifier, name)| match name {
+            MethodName::Known(name) => Some((identifier, name)),
+            MethodName::Ambiguous => None,
+        })
+        .collect()
+}
+
+pub(super) fn fallback_method_name<'a>(
+    value: &InstructionValue<'a>,
+    method_names: &FxHashMap<IdentifierId, Ident<'a>>,
+) -> Option<Ident<'a>> {
+    match value {
+        InstructionValue::MethodCall { property, .. } => {
+            method_names.get(&property.identifier).copied()
+        }
+        _ => None,
+    }
 }
 
 fn aliasing_value_flows_to_return(
@@ -716,19 +825,13 @@ fn get_context_reassignment(
     let mut captured_contexts = CapturedContexts::default();
     let mut returned_captured_contexts = CapturedContexts::default();
     let mut returned_loaded_contexts = CapturedContexts::default();
+    let method_names = collect_method_names(func);
     let (initial_context_values, context_values_by_block, hoisted_function_values) =
         infer_context_values_by_block(func, functions);
-    // Bindings owned by this function are ordinary locals while it executes,
-    // but become context variables for child closures.
+    // Only bindings owned by the outer component or hook are render context
+    // variables. Locals owned by a nested callback are created when that
+    // callback executes, so child closures may safely reassign them.
     let mut child_context_variables = context_variables.clone();
-    for param in &func.params {
-        let place = match param {
-            ParamPattern::Place(place) => place,
-            ParamPattern::Spread(spread) => &spread.place,
-        };
-        child_context_variables.insert(place.identifier);
-    }
-    collect_outer_context_variables(func, &mut child_context_variables);
 
     for (&block_id, block) in &func.body.blocks {
         let mut context_values = context_values_at_block_entry(
@@ -905,7 +1008,12 @@ fn get_context_reassignment(
                 }
 
                 _ => {
-                    for operand in each_reassigning_operand(&instr.value, env) {
+                    let fallback_method = fallback_method_name(&instr.value, &method_names);
+                    for operand in each_reassigning_operand(
+                        &instr.value,
+                        env,
+                        fallback_method.as_ref().map(|name| name.as_str()),
+                    ) {
                         // Invariant: effects must be inferred before this pass runs
                         assert!(
                             operand.effect != Effect::Unknown,
@@ -927,7 +1035,16 @@ fn get_context_reassignment(
                 | InstructionValue::MethodCall { args, .. } => args.len(),
                 _ => 0,
             };
-            if !no_alias_callback_parameters(&instr.value, env, true, argument_count).is_empty() {
+            let fallback_method = fallback_method_name(&instr.value, &method_names);
+            if !no_alias_callback_parameters(
+                &instr.value,
+                env,
+                fallback_method.as_ref().map(|name| name.as_str()),
+                true,
+                argument_count,
+            )
+            .is_empty()
+            {
                 no_alias_calls.push((
                     instruction_id,
                     each_instruction_lvalue_ids(instr),
@@ -1097,7 +1214,12 @@ fn get_context_reassignment(
                 | InstructionValue::DeclareContext { .. } => {}
 
                 _ => {
-                    for operand in each_reassigning_operand(&instr.value, env) {
+                    let fallback_method = fallback_method_name(&instr.value, &method_names);
+                    for operand in each_reassigning_operand(
+                        &instr.value,
+                        env,
+                        fallback_method.as_ref().map(|name| name.as_str()),
+                    ) {
                         assert!(
                             operand.effect != Effect::Unknown,
                             "Expected effects to be inferred prior to \

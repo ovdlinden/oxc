@@ -1,0 +1,21 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/synchronous-imported-callback-reassigns-render-local.tsx
+---
+import { c as _c } from "react/compiler-runtime";
+import replace from "string-replace-to-array";
+function Component(t0) {
+	const $ = _c(3);
+	const { text, pattern } = t0;
+	let t1;
+	if ($[0] !== pattern || $[1] !== text) {
+		let index = 0;
+		t1 = replace(text, pattern, (match) => <span key={index++}>{match}</span>);
+		$[0] = pattern;
+		$[1] = text;
+		$[2] = t1;
+	} else {
+		t1 = $[2];
+	}
+	return t1;
+}
