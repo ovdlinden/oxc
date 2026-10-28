@@ -1,0 +1,9 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/mutation-in-foreach-callback-reported-once.tsx
+---
+Diagnostics:
+
+OxcDiagnostic { inner: OxcDiagnosticInner { message: "This value cannot be modified", labels: [LabeledSpan { label: Some("`customFilters` cannot be modified"), span: Span { start: 156, end: 169 }, primary: true }, LabeledSpan { label: Some("`customFilters` originates here"), span: Span { start: 46, end: 59 }, primary: false }], help: Some("Do not mutate component props or hook arguments. If the value should change, update it where it is owned and pass an update callback, or use local state"), note: Some("React Compiler skipped optimizing this component or hook"), severity: Error, code: OxcCode { scope: Some("react-compiler"), number: Some("Immutability") }, url: Some("https://react.dev/reference/eslint-plugin-react-hooks/lints/immutability") } }
+
+No changes.

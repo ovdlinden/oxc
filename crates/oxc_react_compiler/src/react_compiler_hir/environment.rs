@@ -353,15 +353,23 @@ impl<'a> Environment<'a> {
 
     pub fn record_error(&mut self, diagnostic: OxcDiagnostic) -> Result<(), OxcDiagnostic> {
         if ErrorCategory::Invariant.matches(&diagnostic) {
-            self.errors.push(diagnostic.clone());
+            self.push_diagnostic(diagnostic.clone());
             return Err(diagnostic);
         }
-        self.errors.push(diagnostic);
+        self.push_diagnostic(diagnostic);
         Ok(())
     }
 
     pub fn record_diagnostic(&mut self, diagnostic: OxcDiagnostic) {
-        self.errors.push(diagnostic);
+        self.push_diagnostic(diagnostic);
+    }
+
+    fn push_diagnostic(&mut self, diagnostic: OxcDiagnostic) {
+        // The same error can reach the environment through multiple analysis
+        // or codegen paths. Report each source-specific diagnostic once.
+        if !self.errors.contains(&diagnostic) {
+            self.errors.push(diagnostic);
+        }
     }
 
     /// Intern an aliasing-effect diagnostic into the environment-owned side tables.
