@@ -748,9 +748,13 @@ impl<'a, C: Config> ParserImpl<'a, C> {
 
     fn parse_lhs_expression_or_higher_impl(&mut self) -> Expression<'a> {
         let start = self.cur_start();
-        let mut in_optional_chain = false;
         // `MemberExpression`
         let primary = self.parse_primary_expression();
+        self.parse_lhs_expression_rest(start, primary)
+    }
+
+    fn parse_lhs_expression_rest(&mut self, start: u32, primary: Expression<'a>) -> Expression<'a> {
+        let mut in_optional_chain = false;
         let member_expression = self.parse_member_expression_rest(
             start,
             primary,
@@ -1221,6 +1225,10 @@ impl<'a, C: Config> ParserImpl<'a, C> {
 
         let start = self.cur_start();
         let lhs = self.parse_lhs_expression_or_higher();
+        self.parse_postfix_expression(start, lhs)
+    }
+
+    fn parse_postfix_expression(&mut self, start: u32, lhs: Expression<'a>) -> Expression<'a> {
         // ++ -- postfix update expressions
         let post_kind = self.cur_kind();
         if post_kind.is_update_operator() && !self.cur_token().is_on_new_line() {
@@ -1304,10 +1312,39 @@ impl<'a, C: Config> ParserImpl<'a, C> {
 
         let lhs_parenthesized = self.at(Kind::LParen);
         // [+In] PrivateIdentifier in ShiftExpression[?Yield, ?Await]
-        let lhs = if self.ctx.has_in() && self.at(Kind::PrivateIdentifier) {
+        let kind = self.cur_kind();
+        let lhs = if self.ctx.has_in() && kind == Kind::PrivateIdentifier {
             self.parse_private_in_expression(lhs_start, lhs_precedence)
-        } else {
+        } else if kind.is_unary_operator()
+            || kind.is_update_operator()
+            || matches!(kind, Kind::Await | Kind::LAngle)
+        {
             self.parse_unary_expression_or_higher(lhs_start)
+        } else {
+            // Most operands start with a primary expression. Skip unary/update dispatch, and
+            // only enter member/call parsing when the following token can extend the primary.
+            let pure_comments = self.lexer.trivia_builder.previous_token_pure_comments();
+            let primary = self.parse_primary_expression();
+            let mut lhs = if matches!(
+                self.cur_kind(),
+                Kind::Dot
+                    | Kind::LBrack
+                    | Kind::LParen
+                    | Kind::QuestionDot
+                    | Kind::NoSubstitutionTemplate
+                    | Kind::TemplateHead
+                    | Kind::Bang
+                    | Kind::LAngle
+                    | Kind::ShiftLeft
+            ) {
+                self.parse_lhs_expression_rest(lhs_start, primary)
+            } else {
+                primary
+            };
+            if let Some(comments) = pure_comments {
+                self.apply_pure_comments_to_call(comments, &mut lhs);
+            }
+            self.parse_postfix_expression(lhs_start, lhs)
         };
 
         self.parse_binary_expression_rest(lhs_start, lhs, lhs_parenthesized, lhs_precedence)
