@@ -604,6 +604,81 @@ struct SubstitutionScope {
     rest_arguments: FxHashMap<IdentifierId, Properties>,
 }
 
+/// A returned callable can be reached through several branches of the same
+/// deferred-call graph. Cache by the immutable summary and capture snapshot,
+/// then compare the argument and ancestor state within that bucket.
+struct ReturnResolutionState {
+    key: (usize, usize),
+    bound_arguments: Arguments,
+    arguments: Arguments,
+}
+
+struct ReturnResolutionCacheEntry {
+    bound_arguments: Arguments,
+    arguments: Arguments,
+    dependencies: FxHashSet<IdentifierId>,
+    values: Values,
+}
+
+#[derive(Default)]
+struct ReturnResolutionCache {
+    entries: FxHashMap<(usize, usize), Vec<ReturnResolutionCacheEntry>>,
+    active_dependencies: Vec<FxHashSet<IdentifierId>>,
+}
+
+impl ReturnResolutionCache {
+    fn begin(&mut self) {
+        self.active_dependencies.push(FxHashSet::default());
+    }
+
+    fn record_dependency(&mut self, id: IdentifierId) {
+        for dependencies in &mut self.active_dependencies {
+            dependencies.insert(id);
+        }
+    }
+
+    fn finish(&mut self) -> FxHashSet<IdentifierId> {
+        self.active_dependencies.pop().expect("active return resolution")
+    }
+}
+
+impl ReturnResolutionState {
+    fn new(callable: &Callable, returned: &Rc<ReturnedCallables>, arguments: &Arguments) -> Self {
+        Self {
+            key: (Rc::as_ptr(returned) as usize, Rc::as_ptr(&callable.context_values) as usize),
+            bound_arguments: callable.bound_arguments.clone(),
+            arguments: arguments.clone(),
+        }
+    }
+
+    fn get(
+        &self,
+        cache: &mut ReturnResolutionCache,
+        visiting: &FxHashSet<IdentifierId>,
+    ) -> Option<Values> {
+        let (dependencies, values) = cache.entries.get(&self.key)?.iter().find_map(|entry| {
+            (entry.bound_arguments == self.bound_arguments
+                && entry.arguments == self.arguments
+                && entry.dependencies.is_disjoint(visiting))
+            .then(|| (entry.dependencies.clone(), entry.values.clone()))
+        })?;
+        for active in &mut cache.active_dependencies {
+            active.extend(&dependencies);
+        }
+        Some(values)
+    }
+
+    fn insert(self, values: Values, cache: &mut ReturnResolutionCache) {
+        let dependencies = cache.finish();
+        cache.entries.entry(self.key).or_default().push(ReturnResolutionCacheEntry {
+            bound_arguments: self.bound_arguments,
+            arguments: self.arguments,
+            dependencies,
+            values,
+        });
+    }
+}
+
 enum DeferredInput {
     Callee(IdentifierId),
     Argument { key: Option<String>, value: IdentifierId },
@@ -639,6 +714,9 @@ enum ResolutionAction {
     Returned {
         callable: Callable,
         arguments: Arguments,
+    },
+    FinishReturned {
+        state: ReturnResolutionState,
     },
     FinishProjection {
         id: IdentifierId,
@@ -1511,6 +1589,7 @@ impl CallableState {
         &self,
         initial: ResolutionAction,
         visiting: &mut FxHashSet<IdentifierId>,
+        cache: &mut ReturnResolutionCache,
     ) -> Option<Values> {
         let mut actions = vec![initial];
         let mut results: Vec<Option<Values>> = Vec::new();
@@ -1523,6 +1602,7 @@ impl CallableState {
                         continue;
                     }
                     if let Some(call) = scope.returned.deferred_calls.get(&id).cloned() {
+                        cache.record_dependency(id);
                         if !visiting.insert(id) {
                             results.push(None);
                             continue;
@@ -1556,6 +1636,7 @@ impl CallableState {
                         results.push(None);
                         continue;
                     };
+                    cache.record_dependency(id);
                     if sources.is_empty() || !visiting.insert(id) {
                         results.push(None);
                         continue;
@@ -1600,8 +1681,22 @@ impl CallableState {
                         results.push(Some(Values::default()));
                         continue;
                     };
+                    let state = (!returned.deferred_calls.is_empty())
+                        .then(|| ReturnResolutionState::new(&callable, returned, &arguments));
+                    if let Some(values) =
+                        state.as_ref().and_then(|state| state.get(cache, visiting))
+                    {
+                        results.push(Some(values));
+                        continue;
+                    }
+                    if state.is_some() {
+                        cache.begin();
+                    }
                     let (substitutions, rest_arguments) =
                         self.call_substitutions(&callable, returned, &arguments);
+                    if let Some(state) = state {
+                        actions.push(ResolutionAction::FinishReturned { state });
+                    }
                     actions.push(ResolutionAction::Values {
                         original: returned.values.clone(),
                         scope: Rc::new(SubstitutionScope {
@@ -1610,6 +1705,13 @@ impl CallableState {
                             rest_arguments,
                         }),
                     });
+                }
+                ResolutionAction::FinishReturned { state } => {
+                    let values = results.pop().expect("returned values result");
+                    if let Some(values) = &values {
+                        state.insert(values.clone(), cache);
+                    }
+                    results.push(values);
                 }
                 ResolutionAction::FinishProjection { id, scope, sources, child_count } => {
                     let child_results = results.split_off(results.len() - child_count);
@@ -1806,7 +1908,13 @@ impl CallableState {
     }
 
     fn resolve_identifier(&self, id: IdentifierId, scope: Rc<SubstitutionScope>) -> Option<Values> {
-        self.substitute_recursive(id, &scope, &mut FxHashSet::default(), 0)
+        self.substitute_recursive(
+            id,
+            &scope,
+            &mut FxHashSet::default(),
+            &mut ReturnResolutionCache::default(),
+            0,
+        )
     }
 
     /// Keep the common shallow path allocation-free, then transfer to the
@@ -1816,25 +1924,28 @@ impl CallableState {
         id: IdentifierId,
         scope: &Rc<SubstitutionScope>,
         visiting: &mut FxHashSet<IdentifierId>,
+        cache: &mut ReturnResolutionCache,
         depth: usize,
     ) -> Option<Values> {
         if depth == MAX_SUBSTITUTION_RECURSION_DEPTH {
             return self.resolve_substitutions(
                 ResolutionAction::Identifier { id, scope: Rc::clone(scope) },
                 visiting,
+                cache,
             );
         }
         if let Some(values) = scope.substitutions.get(&id) {
             return Some(values.clone());
         }
         if let Some(call) = scope.returned.deferred_calls.get(&id) {
+            cache.record_dependency(id);
             if !visiting.insert(id) {
                 return None;
             }
             let mut callees = Values::default();
             for &callee in &call.callees {
                 let selected = self
-                    .substitute_recursive(callee, scope, visiting, depth + 1)
+                    .substitute_recursive(callee, scope, visiting, cache, depth + 1)
                     .unwrap_or_else(|| self.values(callee));
                 callees.extend(&selected);
             }
@@ -1842,7 +1953,7 @@ impl CallableState {
             for values in arguments.elements.values_mut() {
                 for value in values.identities.clone() {
                     if let Some(selected) =
-                        self.substitute_recursive(value, scope, visiting, depth + 1)
+                        self.substitute_recursive(value, scope, visiting, cache, depth + 1)
                     {
                         values.identities.remove(&value);
                         values.extend(&selected);
@@ -1855,6 +1966,7 @@ impl CallableState {
                     callable,
                     &arguments,
                     visiting,
+                    cache,
                     depth + 1,
                 ));
             }
@@ -1865,6 +1977,7 @@ impl CallableState {
             return Some(result);
         }
         let sources = scope.returned.projections.get(&id)?;
+        cache.record_dependency(id);
         if sources.is_empty() || !visiting.insert(id) {
             return None;
         }
@@ -1884,7 +1997,7 @@ impl CallableState {
                 continue;
             }
             if let Some(objects) =
-                self.substitute_recursive(source.object, scope, visiting, depth + 1)
+                self.substitute_recursive(source.object, scope, visiting, cache, depth + 1)
             {
                 result.extend(&self.project(&objects, &source.key));
             } else {
@@ -2055,7 +2168,13 @@ impl CallableState {
     }
 
     fn returned_values(&self, callable: &Callable, arguments: &Arguments) -> Values {
-        self.returned_values_recursive(callable, arguments, &mut FxHashSet::default(), 0)
+        self.returned_values_recursive(
+            callable,
+            arguments,
+            &mut FxHashSet::default(),
+            &mut ReturnResolutionCache::default(),
+            0,
+        )
     }
 
     fn returned_values_recursive(
@@ -2063,6 +2182,7 @@ impl CallableState {
         callable: &Callable,
         arguments: &Arguments,
         visiting: &mut FxHashSet<IdentifierId>,
+        cache: &mut ReturnResolutionCache,
         depth: usize,
     ) -> Values {
         // Async calls produce promises, not the eventual returned callable.
@@ -2072,6 +2192,11 @@ impl CallableState {
         let Some(returned) = callable.returned.as_ref() else {
             return Values::default();
         };
+        let state = (!returned.deferred_calls.is_empty())
+            .then(|| ReturnResolutionState::new(callable, returned, arguments));
+        if let Some(values) = state.as_ref().and_then(|state| state.get(cache, visiting)) {
+            return values;
+        }
         if depth == MAX_SUBSTITUTION_RECURSION_DEPTH {
             return self
                 .resolve_substitutions(
@@ -2080,12 +2205,16 @@ impl CallableState {
                         arguments: arguments.clone(),
                     },
                     visiting,
+                    cache,
                 )
                 .unwrap_or_default();
         }
+        if state.is_some() {
+            cache.begin();
+        }
         let (substitutions, rest_arguments) =
             self.call_substitutions(callable, returned, arguments);
-        self.substitute_values_recursive(
+        let values = self.substitute_values_recursive(
             &returned.values,
             &Rc::new(SubstitutionScope {
                 returned: Rc::clone(returned),
@@ -2093,12 +2222,23 @@ impl CallableState {
                 rest_arguments,
             }),
             visiting,
+            cache,
             depth + 1,
-        )
+        );
+        if let Some(state) = state {
+            state.insert(values.clone(), cache);
+        }
+        values
     }
 
     fn substitute_values(&self, original: &Values, scope: Rc<SubstitutionScope>) -> Values {
-        self.substitute_values_recursive(original, &scope, &mut FxHashSet::default(), 0)
+        self.substitute_values_recursive(
+            original,
+            &scope,
+            &mut FxHashSet::default(),
+            &mut ReturnResolutionCache::default(),
+            0,
+        )
     }
 
     fn substitute_values_recursive(
@@ -2106,6 +2246,7 @@ impl CallableState {
         original: &Values,
         scope: &Rc<SubstitutionScope>,
         visiting: &mut FxHashSet<IdentifierId>,
+        cache: &mut ReturnResolutionCache,
         depth: usize,
     ) -> Values {
         if depth == MAX_SUBSTITUTION_RECURSION_DEPTH {
@@ -2116,6 +2257,7 @@ impl CallableState {
                         scope: Rc::clone(scope),
                     },
                     visiting,
+                    cache,
                 )
                 .unwrap_or_default();
         }
@@ -2123,7 +2265,8 @@ impl CallableState {
         // Returning a parameter snapshots the selected callable; a newly
         // returned closure retains the caller's live binding information.
         for identity in &original.identities {
-            if let Some(selected) = self.substitute_recursive(*identity, scope, visiting, depth + 1)
+            if let Some(selected) =
+                self.substitute_recursive(*identity, scope, visiting, cache, depth + 1)
             {
                 values.identities.remove(identity);
                 values.extend(&selected);
@@ -2154,7 +2297,7 @@ impl CallableState {
                                     .flat_map(|value| value.identities.iter().copied())
                                     .collect();
                             }
-                            self.substitute_recursive(*value, scope, visiting, depth + 1)
+                            self.substitute_recursive(*value, scope, visiting, cache, depth + 1)
                                 .map_or_else(
                                     || FxHashSet::from_iter([*value]),
                                     |values| values.identities,

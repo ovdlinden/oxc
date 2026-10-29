@@ -117,11 +117,16 @@ impl Node {
 struct AliasingState {
     nodes: FxHashMap<IdentifierId, Node>,
     called_declarations: FxHashMap<FunctionId, FxHashSet<DeclarationId>>,
+    function_declarations: Option<FxHashMap<DeclarationId, FunctionId>>,
 }
 
 impl AliasingState {
     fn new() -> Self {
-        AliasingState { nodes: FxHashMap::default(), called_declarations: FxHashMap::default() }
+        AliasingState {
+            nodes: FxHashMap::default(),
+            called_declarations: FxHashMap::default(),
+            function_declarations: None,
+        }
     }
 
     fn create(&mut self, place: &Place, value: NodeValue) {
@@ -417,10 +422,17 @@ impl AliasingState {
                             env.types[env.identifiers[*capture].type_],
                             Type::Function { .. }
                         ) || capturing_function.is_some_and(|function_id| {
+                            let function_declarations = self
+                                .function_declarations
+                                .get_or_insert_with(|| collect_function_declarations(env));
                             self.called_declarations
                                 .entry(function_id)
                                 .or_insert_with(|| {
-                                    synchronously_called_declarations(env, function_id)
+                                    synchronously_called_declarations(
+                                        env,
+                                        function_id,
+                                        function_declarations,
+                                    )
                                 })
                                 .contains(&env.identifiers[*capture].declaration_id)
                         }));
@@ -437,28 +449,89 @@ impl AliasingState {
     }
 }
 
+type ParameterBindings = FxHashMap<DeclarationId, FxHashSet<DeclarationId>>;
+
+fn collect_function_declarations(env: &Environment) -> FxHashMap<DeclarationId, FunctionId> {
+    let mut declarations = FxHashMap::default();
+    for index in 0..env.functions.len() {
+        let func = &env.functions[FunctionId::from_usize(index)];
+        for instr in &func.instructions {
+            if let InstructionValue::FunctionExpression { lowered_func, .. }
+            | InstructionValue::ObjectMethod { lowered_func, .. } = &instr.value
+            {
+                declarations.insert(
+                    env.identifiers[instr.lvalue.identifier].declaration_id,
+                    lowered_func.func,
+                );
+            }
+        }
+    }
+    declarations
+}
+
+fn resolve_called_declarations(
+    env: &Environment,
+    identifier: IdentifierId,
+    sources: &FxHashMap<IdentifierId, FxHashSet<IdentifierId>>,
+    bindings: &ParameterBindings,
+) -> FxHashSet<DeclarationId> {
+    let mut identifiers = vec![identifier];
+    let mut seen_identifiers = FxHashSet::default();
+    let mut pending_declarations = Vec::new();
+    while let Some(current) = identifiers.pop() {
+        if !seen_identifiers.insert(current) {
+            continue;
+        }
+        pending_declarations.push(env.identifiers[current].declaration_id);
+        identifiers.extend(sources.get(&current).into_iter().flatten().copied());
+    }
+
+    let mut declarations = FxHashSet::default();
+    while let Some(declaration) = pending_declarations.pop() {
+        if !declarations.insert(declaration) {
+            continue;
+        }
+        pending_declarations.extend(bindings.get(&declaration).into_iter().flatten().copied());
+    }
+    declarations
+}
+
 /// Declarations that `function_id` calls synchronously, including through local wrappers.
 ///
 /// Unlike the TS implementation, the Oxc-only render-purity refinement distinguishes
 /// captured callbacks that are invoked from callbacks that merely escape. Resolve
-/// local aliases, `Function.prototype.call`/`apply`, and invoked local wrappers before
-/// making that distinction.
+/// local aliases, `Function.prototype.call`/`apply`, invoked local wrappers, and callback
+/// arguments forwarded through wrapper parameters before making that distinction.
 fn synchronously_called_declarations(
     env: &Environment,
     function_id: FunctionId,
+    function_declarations: &FxHashMap<DeclarationId, FunctionId>,
 ) -> FxHashSet<DeclarationId> {
+    struct Called {
+        callee: IdentifierId,
+        arguments: Option<Vec<IdentifierId>>,
+    }
+
+    let argument_identifier = |argument: &PlaceOrSpread| match argument {
+        PlaceOrSpread::Place(place) => place.identifier,
+        PlaceOrSpread::Spread(spread) => spread.place.identifier,
+    };
+
     let mut declarations = FxHashSet::default();
     let mut pending_functions = vec![function_id];
-    let mut seen_functions = FxHashSet::default();
+    let mut function_bindings: FxHashMap<FunctionId, ParameterBindings> = FxHashMap::default();
+    let mut analyzed_bindings: FxHashMap<FunctionId, ParameterBindings> = FxHashMap::default();
 
     while let Some(function_id) = pending_functions.pop() {
-        if !seen_functions.insert(function_id) {
+        let bindings = function_bindings.get(&function_id).cloned().unwrap_or_default();
+        if analyzed_bindings.get(&function_id) == Some(&bindings) {
             continue;
         }
+        analyzed_bindings.insert(function_id, bindings.clone());
+
         let func = &env.functions[function_id];
         let mut sources: FxHashMap<IdentifierId, FxHashSet<IdentifierId>> = FxHashMap::default();
         let mut method_names = FxHashMap::default();
-        let mut local_functions = FxHashMap::default();
         for (_, block) in &func.body.blocks {
             for phi in &block.phis {
                 sources
@@ -493,34 +566,9 @@ fn synchronously_called_declarations(
                 {
                     sources.entry(into).or_default().insert(object.identifier);
                 }
-                InstructionValue::FunctionExpression { lowered_func, .. }
-                | InstructionValue::ObjectMethod { lowered_func, .. } => {
-                    local_functions.insert(env.identifiers[into].declaration_id, lowered_func.func);
-                }
-                InstructionValue::CallExpression { callee, .. }
-                | InstructionValue::NewExpression { callee, .. } => {
-                    called.push(callee.identifier);
-                }
-                InstructionValue::MethodCall { property, .. } => called.push(property.identifier),
-                InstructionValue::TaggedTemplateExpression { tag, .. } => {
-                    called.push(tag.identifier);
-                }
                 _ => {}
             }
-            let args = match &instr.value {
-                InstructionValue::CallExpression { args, .. }
-                | InstructionValue::MethodCall { args, .. } => args,
-                _ => continue,
-            };
-            if !args.iter().any(|argument| {
-                let identifier = match argument {
-                    PlaceOrSpread::Place(place) => place.identifier,
-                    PlaceOrSpread::Spread(spread) => spread.place.identifier,
-                };
-                matches!(env.types[env.identifiers[identifier].type_], Type::Function { .. })
-            }) {
-                continue;
-            }
+
             let fallback_method = match &instr.value {
                 InstructionValue::MethodCall { property, .. } => {
                     let mut pending = vec![property.identifier];
@@ -543,6 +591,52 @@ fn synchronously_called_declarations(
                 }
                 _ => None,
             };
+
+            let arguments = match &instr.value {
+                InstructionValue::CallExpression { args, .. }
+                | InstructionValue::NewExpression { args, .. } => {
+                    Some(args.iter().map(argument_identifier).collect())
+                }
+                InstructionValue::MethodCall { args, .. }
+                    if fallback_method.as_ref().is_some_and(|name| name == "call") =>
+                {
+                    Some(args.iter().skip(1).map(argument_identifier).collect())
+                }
+                InstructionValue::MethodCall { .. }
+                    if fallback_method.as_ref().is_some_and(|name| name == "apply") =>
+                {
+                    None
+                }
+                InstructionValue::MethodCall { args, .. } => {
+                    Some(args.iter().map(argument_identifier).collect())
+                }
+                _ => None,
+            };
+            match &instr.value {
+                InstructionValue::CallExpression { callee, .. }
+                | InstructionValue::NewExpression { callee, .. } => {
+                    called.push(Called { callee: callee.identifier, arguments });
+                }
+                InstructionValue::MethodCall { property, .. } => {
+                    called.push(Called { callee: property.identifier, arguments });
+                }
+                InstructionValue::TaggedTemplateExpression { tag, .. } => {
+                    called.push(Called { callee: tag.identifier, arguments: None });
+                }
+                _ => {}
+            }
+
+            let args = match &instr.value {
+                InstructionValue::CallExpression { args, .. }
+                | InstructionValue::MethodCall { args, .. } => args,
+                _ => continue,
+            };
+            if !args.iter().any(|argument| {
+                let identifier = argument_identifier(argument);
+                matches!(env.types[env.identifiers[identifier].type_], Type::Function { .. })
+            }) {
+                continue;
+            }
             for index in no_alias_callback_parameters(
                 &instr.value,
                 env,
@@ -551,27 +645,55 @@ fn synchronously_called_declarations(
                 args.len(),
             ) {
                 if let Some(argument) = args.get(index) {
-                    called.push(match argument {
-                        PlaceOrSpread::Place(place) => place.identifier,
-                        PlaceOrSpread::Spread(spread) => spread.place.identifier,
-                    });
+                    called.push(Called { callee: argument_identifier(argument), arguments: None });
                 }
             }
         }
 
-        for callee in called {
-            let mut pending = vec![callee];
-            let mut seen = FxHashSet::default();
-            while let Some(current) = pending.pop() {
-                if !seen.insert(current) {
+        for call in called {
+            let callees = resolve_called_declarations(env, call.callee, &sources, &bindings);
+            declarations.extend(&callees);
+            for declaration in callees {
+                let Some(&called_function) = function_declarations.get(&declaration) else {
                     continue;
+                };
+                let mut changed = false;
+                if let Some(arguments) = &call.arguments {
+                    let argument_declarations: Vec<_> = arguments
+                        .iter()
+                        .map(|&argument| {
+                            resolve_called_declarations(env, argument, &sources, &bindings)
+                        })
+                        .collect();
+                    let target = function_bindings.entry(called_function).or_default();
+                    for (index, parameter) in
+                        env.functions[called_function].params.iter().enumerate()
+                    {
+                        let (parameter, values) = match parameter {
+                            ParamPattern::Place(place) => (
+                                place.identifier,
+                                argument_declarations.get(index).cloned().unwrap_or_default(),
+                            ),
+                            ParamPattern::Spread(spread) => (
+                                spread.place.identifier,
+                                argument_declarations
+                                    .iter()
+                                    .skip(index)
+                                    .flatten()
+                                    .copied()
+                                    .collect(),
+                            ),
+                        };
+                        let into =
+                            target.entry(env.identifiers[parameter].declaration_id).or_default();
+                        let old_len = into.len();
+                        into.extend(values);
+                        changed |= into.len() != old_len;
+                    }
                 }
-                let declaration = env.identifiers[current].declaration_id;
-                declarations.insert(declaration);
-                if let Some(&function_id) = local_functions.get(&declaration) {
-                    pending_functions.push(function_id);
+                if changed || !analyzed_bindings.contains_key(&called_function) {
+                    pending_functions.push(called_function);
                 }
-                pending.extend(sources.get(&current).into_iter().flatten().copied());
             }
         }
     }

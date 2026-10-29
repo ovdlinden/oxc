@@ -120,3 +120,9 @@ export function HelperCalledThroughIife({ items }) {
   const getTime = () => Date.now();
   return <div>{items.map(() => (() => getTime())())}</div>;
 }
+
+// Synchronously invoked wrappers may forward the called helper as a parameter.
+export function HelperForwardedThroughIife({ items }) {
+  const getTime = () => Date.now();
+  return <div>{items.map(() => ((call) => call())(getTime))}</div>;
+}
