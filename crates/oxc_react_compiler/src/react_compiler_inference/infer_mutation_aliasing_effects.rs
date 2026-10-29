@@ -188,6 +188,7 @@ pub fn infer_mutation_aliasing_effects<'a>(
         non_mutating_spreads,
         effect_value_id_cache: FxHashMap::default(),
         function_values: FxHashMap::default(),
+        array_values: FxHashMap::default(),
         function_signature_cache: FxHashMap::default(),
         aliasing_config_temp_cache: FxHashMap::default(),
     };
@@ -779,6 +780,10 @@ struct Context<'a> {
     /// Maps ValueId to FunctionId for function expressions, so we can look up
     /// locally-declared functions when processing Apply effects.
     function_values: FxHashMap<ValueId, FunctionId>,
+    /// Exact elements of locally-created arrays, keyed by their abstract value.
+    /// This allows a spread array literal to bind fixed parameters of a local
+    /// function without treating arbitrary captured functions as invoked.
+    array_values: FxHashMap<ValueId, Vec<Option<Place>>>,
     /// Cache of function expression signatures, keyed by FunctionId
     function_signature_cache: FxHashMap<FunctionId, AliasingSignature<'a>>,
     /// Cache of temporary places created for aliasing signature config temporaries.
@@ -1399,6 +1404,31 @@ fn apply_signature<'a>(
 ) -> Result<Option<Vec<AliasingEffect<'a>>>, OxcDiagnostic> {
     let mut effects: Vec<AliasingEffect<'a>> = Vec::new();
 
+    let array_elements = if let InstructionValue::ArrayExpression { elements, .. } = &instr.value {
+        let mut resolved = Vec::new();
+        let mut exact = true;
+        for element in elements {
+            match element {
+                ArrayElement::Place(place) => resolved.push(Some(*place)),
+                ArrayElement::Hole => resolved.push(None),
+                ArrayElement::Spread(spread) => {
+                    let values = state.values_for(spread.place.identifier);
+                    if values.len() == 1
+                        && let Some(elements) = context.array_values.get(&values[0])
+                    {
+                        resolved.extend(elements.iter().copied());
+                    } else {
+                        exact = false;
+                        break;
+                    }
+                }
+            }
+        }
+        exact.then_some(resolved)
+    } else {
+        None
+    };
+
     // For function instructions, validate frozen mutation
     match &instr.value {
         InstructionValue::FunctionExpression { lowered_func, .. }
@@ -1468,6 +1498,12 @@ fn apply_signature<'a>(
             },
         );
         state.define(instr.lvalue.identifier, vid);
+    }
+
+    if let Some(elements) = array_elements {
+        for value in state.values_for(instr.lvalue.identifier) {
+            context.array_values.insert(value, elements.clone());
+        }
     }
 
     Ok(if effects.is_empty() { None } else { Some(effects) })
@@ -1845,12 +1881,14 @@ fn apply_effect_ref<'a>(
                             let inner_func = &env.functions[func_id];
                             let context_places: Vec<Place> =
                                 inner_func.context.iter().copied().collect();
+                            let resolved_args =
+                                resolve_spread_arguments(args, state, &context.array_values);
                             let sig_effects = compute_effects_for_aliasing_signature(
                                 env,
                                 &sig,
                                 into,
                                 receiver,
-                                args,
+                                &resolved_args,
                                 &context_places,
                                 span.as_ref(),
                             )?;
@@ -2023,6 +2061,9 @@ fn apply_effect_ref<'a>(
                 _ => unreachable!(),
             };
             let value = mutate_place;
+            for value_id in state.values_for(value.identifier) {
+                context.array_values.remove(&value_id);
+            }
             let mutation_kind = state.mutate_with_span(variant, value.identifier, env, value.span);
             if mutation_kind == MutationResult::Mutate {
                 effects.push(effect.clone_in(context.alloc));
@@ -2989,6 +3030,29 @@ fn build_signature_from_function_expression<'a>(
 
 /// Compute effects by substituting an AliasingSignature (IdentifierId-based)
 /// with actual arguments. Corresponds to TS `computeEffectsForSignature`.
+fn resolve_spread_arguments(
+    args: &[PlaceOrSpreadOrHole],
+    state: &InferenceState,
+    array_values: &FxHashMap<ValueId, Vec<Option<Place>>>,
+) -> Vec<PlaceOrSpreadOrHole> {
+    let mut resolved = Vec::new();
+    for arg in args {
+        if let PlaceOrSpreadOrHole::Spread(spread) = arg {
+            let values = state.values_for(spread.place.identifier);
+            if values.len() == 1
+                && let Some(elements) = array_values.get(&values[0])
+            {
+                resolved.extend(elements.iter().map(|element| {
+                    element.map_or(PlaceOrSpreadOrHole::Hole, PlaceOrSpreadOrHole::Place)
+                }));
+                continue;
+            }
+        }
+        resolved.push(*arg);
+    }
+    resolved
+}
+
 fn compute_effects_for_aliasing_signature<'a>(
     env: &mut Environment<'a>,
     signature: &AliasingSignature<'a>,

@@ -126,3 +126,38 @@ export function HelperForwardedThroughIife({ items }) {
   const getTime = () => Date.now();
   return <div>{items.map(() => ((call) => call())(getTime))}</div>;
 }
+
+// Applied and spread argument arrays preserve synchronous callback forwarding.
+export function HelperForwardedThroughApply({ items }) {
+  const getTime = () => Date.now();
+  return <div>{items.map(() => ((call) => call()).apply(null, [getTime]))}</div>;
+}
+
+export function HelperForwardedThroughSpread({ items }) {
+  const getTime = () => Date.now();
+  return <div>{items.map(() => ((call) => call())(...[getTime]))}</div>;
+}
+
+// Calling a function-valued object member invokes the captured helper.
+export function HelperCalledThroughObjectProperty({ items }) {
+  const getTime = () => Date.now();
+  return <div>{items.map(() => ({ getTime }).getTime())}</div>;
+}
+
+// Forwarding inside an event handler still does not execute during render.
+export function HelpersForwardedOnlyInEventHandler({ items }) {
+  const getTime = () => Date.now();
+  return (
+    <div>
+      {items.map((item) => (
+        <button
+          key={item.id}
+          onClick={() => {
+            ((call) => call())(...[getTime]);
+            ({ getTime }).getTime();
+          }}
+        />
+      ))}
+    </div>
+  );
+}

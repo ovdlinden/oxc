@@ -28,9 +28,10 @@ use crate::react_compiler_hir::visitors::{
     for_each_instruction_value_operand_mut, for_each_terminal_operand_mut,
 };
 use crate::react_compiler_hir::{
-    AliasingEffect, BlockId, DeclarationId, Effect, EvaluationOrder, FunctionId, HirFunction,
-    IdentifierId, InstructionValue, MutationReason, ParamPattern, Place, PlaceOrSpread,
-    PropertyLiteral, Terminal, Type, is_jsx_type, is_primitive_type,
+    AliasingEffect, ArrayElement, BlockId, DeclarationId, Effect, EvaluationOrder, FunctionId,
+    HirFunction, IdentifierId, InstructionValue, MutationReason, ObjectPropertyKey,
+    ObjectPropertyOrSpread, ParamPattern, Place, PlaceOrSpread, PropertyLiteral, Terminal, Type,
+    is_jsx_type, is_primitive_type,
 };
 use crate::react_compiler_validation::validate_locals_not_reassigned_after_render::no_alias_callback_parameters;
 use oxc_span::Span;
@@ -450,6 +451,89 @@ impl AliasingState {
 }
 
 type ParameterBindings = FxHashMap<DeclarationId, FxHashSet<DeclarationId>>;
+type PropertySources = FxHashMap<IdentifierId, FxHashMap<Option<String>, FxHashSet<IdentifierId>>>;
+
+fn resolve_property_sources(
+    object: IdentifierId,
+    key: Option<&String>,
+    sources: &FxHashMap<IdentifierId, FxHashSet<IdentifierId>>,
+    properties: &PropertySources,
+) -> FxHashSet<IdentifierId> {
+    let mut result = FxHashSet::default();
+    let mut pending = vec![object];
+    let mut seen = FxHashSet::default();
+    while let Some(current) = pending.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+        if let Some(values) = properties.get(&current) {
+            if let Some(key) = key {
+                result.extend(values.get(&Some(key.clone())).into_iter().flatten().copied());
+                result.extend(values.get(&None).into_iter().flatten().copied());
+            } else {
+                result.extend(values.values().flatten().copied());
+            }
+        }
+        pending.extend(sources.get(&current).into_iter().flatten().copied());
+    }
+    result
+}
+
+fn resolve_collection_sources(
+    object: IdentifierId,
+    sources: &FxHashMap<IdentifierId, FxHashSet<IdentifierId>>,
+    properties: &PropertySources,
+) -> Option<Vec<FxHashSet<IdentifierId>>> {
+    let mut indexed: FxHashMap<usize, FxHashSet<IdentifierId>> = FxHashMap::default();
+    let mut pending = vec![object];
+    let mut seen = FxHashSet::default();
+    let mut found = false;
+    while let Some(current) = pending.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+        if let Some(values) = properties.get(&current) {
+            found = true;
+            for (key, values) in values {
+                let index = key.as_ref()?.parse().ok()?;
+                indexed.entry(index).or_default().extend(values);
+            }
+        }
+        pending.extend(sources.get(&current).into_iter().flatten().copied());
+    }
+    if !found {
+        return None;
+    }
+    let length = indexed.keys().max().map_or(0, |index| index + 1);
+    let mut result = vec![FxHashSet::default(); length];
+    for (index, values) in indexed {
+        result[index].extend(values);
+    }
+    Some(result)
+}
+
+fn resolve_call_arguments(
+    arguments: &[PlaceOrSpread],
+    sources: &FxHashMap<IdentifierId, FxHashSet<IdentifierId>>,
+    properties: &PropertySources,
+) -> Option<Vec<FxHashSet<IdentifierId>>> {
+    let mut result = Vec::new();
+    for argument in arguments {
+        match argument {
+            PlaceOrSpread::Place(place) => {
+                result.push(FxHashSet::from_iter([place.identifier]));
+            }
+            PlaceOrSpread::Spread(spread) => {
+                result.extend(resolve_collection_sources(
+                    spread.place.identifier,
+                    sources,
+                    properties,
+                )?);
+            }
+        }
+    }
+    Some(result)
+}
 
 fn collect_function_declarations(env: &Environment) -> FxHashMap<DeclarationId, FunctionId> {
     let mut declarations = FxHashMap::default();
@@ -507,9 +591,14 @@ fn synchronously_called_declarations(
     function_id: FunctionId,
     function_declarations: &FxHashMap<DeclarationId, FunctionId>,
 ) -> FxHashSet<DeclarationId> {
+    enum CalledArguments {
+        Direct(Vec<PlaceOrSpread>),
+        Apply(IdentifierId),
+    }
+
     struct Called {
         callee: IdentifierId,
-        arguments: Option<Vec<IdentifierId>>,
+        arguments: Option<CalledArguments>,
     }
 
     let argument_identifier = |argument: &PlaceOrSpread| match argument {
@@ -531,6 +620,8 @@ fn synchronously_called_declarations(
 
         let func = &env.functions[function_id];
         let mut sources: FxHashMap<IdentifierId, FxHashSet<IdentifierId>> = FxHashMap::default();
+        let mut properties = PropertySources::default();
+        let mut property_loads = Vec::new();
         let mut method_names = FxHashMap::default();
         for (_, block) in &func.body.blocks {
             for phi in &block.phis {
@@ -561,10 +652,100 @@ fn synchronously_called_declarations(
                     sources.entry(lvalue.place.identifier).or_default().insert(value.identifier);
                     sources.entry(into).or_default().insert(value.identifier);
                 }
-                InstructionValue::PropertyLoad { object, property, .. }
-                    if property.is_string("call") || property.is_string("apply") =>
-                {
-                    sources.entry(into).or_default().insert(object.identifier);
+                InstructionValue::ObjectExpression { properties: object_properties, .. } => {
+                    let mut values: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
+                    for property in object_properties {
+                        match property {
+                            ObjectPropertyOrSpread::Property(property) => {
+                                let key = match property.key {
+                                    ObjectPropertyKey::String { name, .. }
+                                    | ObjectPropertyKey::Identifier { name, .. } => {
+                                        Some(name.to_string())
+                                    }
+                                    ObjectPropertyKey::Computed { .. } => None,
+                                };
+                                values.entry(key).or_default().insert(property.place.identifier);
+                            }
+                            ObjectPropertyOrSpread::Spread(spread) => {
+                                if let Some(spread_values) =
+                                    properties.get(&spread.place.identifier)
+                                {
+                                    for (key, sources) in spread_values {
+                                        values.entry(key.clone()).or_default().extend(sources);
+                                    }
+                                } else {
+                                    values.entry(None).or_default().insert(spread.place.identifier);
+                                }
+                            }
+                        }
+                    }
+                    properties.insert(into, values);
+                }
+                InstructionValue::ArrayExpression { elements, .. } => {
+                    let mut values: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
+                    let mut index = 0;
+                    for element in elements {
+                        match element {
+                            ArrayElement::Place(place) => {
+                                values
+                                    .entry(Some(index.to_string()))
+                                    .or_default()
+                                    .insert(place.identifier);
+                                index += 1;
+                            }
+                            ArrayElement::Spread(spread) => {
+                                if let Some(spread_values) = resolve_collection_sources(
+                                    spread.place.identifier,
+                                    &sources,
+                                    &properties,
+                                ) {
+                                    for sources in spread_values {
+                                        values
+                                            .entry(Some(index.to_string()))
+                                            .or_default()
+                                            .extend(sources);
+                                        index += 1;
+                                    }
+                                } else {
+                                    values.entry(None).or_default().extend(
+                                        resolve_property_sources(
+                                            spread.place.identifier,
+                                            None,
+                                            &sources,
+                                            &properties,
+                                        ),
+                                    );
+                                }
+                            }
+                            ArrayElement::Hole => index += 1,
+                        }
+                    }
+                    properties.insert(into, values);
+                }
+                InstructionValue::PropertyLoad { object, property, .. } => {
+                    property_loads.push((into, object.identifier, Some(property.to_string())));
+                    if property.is_string("call") || property.is_string("apply") {
+                        sources.entry(into).or_default().insert(object.identifier);
+                    }
+                }
+                InstructionValue::ComputedLoad { object, .. } => {
+                    property_loads.push((into, object.identifier, None));
+                }
+                InstructionValue::PropertyStore { object, property, value, .. } => {
+                    properties
+                        .entry(object.identifier)
+                        .or_default()
+                        .entry(Some(property.to_string()))
+                        .or_default()
+                        .insert(value.identifier);
+                }
+                InstructionValue::ComputedStore { object, value, .. } => {
+                    properties
+                        .entry(object.identifier)
+                        .or_default()
+                        .entry(None)
+                        .or_default()
+                        .insert(value.identifier);
                 }
                 _ => {}
             }
@@ -595,20 +776,21 @@ fn synchronously_called_declarations(
             let arguments = match &instr.value {
                 InstructionValue::CallExpression { args, .. }
                 | InstructionValue::NewExpression { args, .. } => {
-                    Some(args.iter().map(argument_identifier).collect())
+                    Some(CalledArguments::Direct(args.iter().copied().collect()))
                 }
                 InstructionValue::MethodCall { args, .. }
                     if fallback_method.as_ref().is_some_and(|name| name == "call") =>
                 {
-                    Some(args.iter().skip(1).map(argument_identifier).collect())
+                    Some(CalledArguments::Direct(args.iter().skip(1).copied().collect()))
                 }
-                InstructionValue::MethodCall { .. }
+                InstructionValue::MethodCall { args, .. }
                     if fallback_method.as_ref().is_some_and(|name| name == "apply") =>
                 {
-                    None
+                    args.get(1)
+                        .map(|argument| CalledArguments::Apply(argument_identifier(argument)))
                 }
                 InstructionValue::MethodCall { args, .. } => {
-                    Some(args.iter().map(argument_identifier).collect())
+                    Some(CalledArguments::Direct(args.iter().copied().collect()))
                 }
                 _ => None,
             };
@@ -650,6 +832,11 @@ fn synchronously_called_declarations(
             }
         }
 
+        for (into, object, key) in property_loads {
+            let values = resolve_property_sources(object, key.as_ref(), &sources, &properties);
+            sources.entry(into).or_default().extend(values);
+        }
+
         for call in called {
             let callees = resolve_called_declarations(env, call.callee, &sources, &bindings);
             declarations.extend(&callees);
@@ -658,11 +845,26 @@ fn synchronously_called_declarations(
                     continue;
                 };
                 let mut changed = false;
-                if let Some(arguments) = &call.arguments {
+                let arguments = match &call.arguments {
+                    Some(CalledArguments::Direct(arguments)) => {
+                        resolve_call_arguments(arguments, &sources, &properties)
+                    }
+                    Some(CalledArguments::Apply(arguments)) => {
+                        resolve_collection_sources(*arguments, &sources, &properties)
+                    }
+                    None => None,
+                };
+                if let Some(arguments) = arguments {
                     let argument_declarations: Vec<_> = arguments
                         .iter()
-                        .map(|&argument| {
-                            resolve_called_declarations(env, argument, &sources, &bindings)
+                        .map(|arguments| {
+                            let mut values = FxHashSet::default();
+                            for &argument in arguments {
+                                values.extend(resolve_called_declarations(
+                                    env, argument, &sources, &bindings,
+                                ));
+                            }
+                            values
                         })
                         .collect();
                     let target = function_bindings.entry(called_function).or_default();
