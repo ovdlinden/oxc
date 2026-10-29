@@ -144,6 +144,26 @@ export function HelperCalledThroughObjectProperty({ items }) {
   return <div>{items.map(() => ({ getTime }).getTime())}</div>;
 }
 
+// Calling a bound function invokes the original captured helper.
+export function HelperCalledThroughBind({ items }) {
+  const getTime = () => Date.now();
+  return <div>{items.map(() => getTime.bind(null)())}</div>;
+}
+
+// Sparse array-like objects must not allocate through their largest property key.
+export function SparseApplyArgumentsDoNotAllocate({ items }) {
+  const getTime = () => Date.now();
+  return (
+    <div>
+      {items.map(() =>
+        ((call) => 1).apply(null, {
+          "18446744073709551615": getTime,
+        }),
+      )}
+    </div>
+  );
+}
+
 // Forwarding inside an event handler still does not execute during render.
 export function HelpersForwardedOnlyInEventHandler({ items }) {
   const getTime = () => Date.now();
@@ -155,6 +175,7 @@ export function HelpersForwardedOnlyInEventHandler({ items }) {
           onClick={() => {
             ((call) => call())(...[getTime]);
             ({ getTime }).getTime();
+            getTime.bind(null)();
           }}
         />
       ))}

@@ -453,6 +453,16 @@ impl AliasingState {
 type ParameterBindings = FxHashMap<DeclarationId, FxHashSet<DeclarationId>>;
 type PropertySources = FxHashMap<IdentifierId, FxHashMap<Option<String>, FxHashSet<IdentifierId>>>;
 
+/// Sparse argument slots and their inferred array-like length.
+///
+/// Object property names are untrusted numeric indices, so a dense vector here could allocate
+/// memory proportional to an arbitrary property value rather than the source size.
+#[derive(Default)]
+struct CollectionSources {
+    values: FxHashMap<usize, FxHashSet<IdentifierId>>,
+    length: usize,
+}
+
 fn resolve_property_sources(
     object: IdentifierId,
     key: Option<&String>,
@@ -483,8 +493,8 @@ fn resolve_collection_sources(
     object: IdentifierId,
     sources: &FxHashMap<IdentifierId, FxHashSet<IdentifierId>>,
     properties: &PropertySources,
-) -> Option<Vec<FxHashSet<IdentifierId>>> {
-    let mut indexed: FxHashMap<usize, FxHashSet<IdentifierId>> = FxHashMap::default();
+) -> Option<CollectionSources> {
+    let mut result = CollectionSources::default();
     let mut pending = vec![object];
     let mut seen = FxHashSet::default();
     let mut found = false;
@@ -495,19 +505,15 @@ fn resolve_collection_sources(
         if let Some(values) = properties.get(&current) {
             found = true;
             for (key, values) in values {
-                let index = key.as_ref()?.parse().ok()?;
-                indexed.entry(index).or_default().extend(values);
+                let index: usize = key.as_ref()?.parse().ok()?;
+                result.length = result.length.max(index.checked_add(1)?);
+                result.values.entry(index).or_default().extend(values);
             }
         }
         pending.extend(sources.get(&current).into_iter().flatten().copied());
     }
     if !found {
         return None;
-    }
-    let length = indexed.keys().max().map_or(0, |index| index + 1);
-    let mut result = vec![FxHashSet::default(); length];
-    for (index, values) in indexed {
-        result[index].extend(values);
     }
     Some(result)
 }
@@ -516,19 +522,22 @@ fn resolve_call_arguments(
     arguments: &[PlaceOrSpread],
     sources: &FxHashMap<IdentifierId, FxHashSet<IdentifierId>>,
     properties: &PropertySources,
-) -> Option<Vec<FxHashSet<IdentifierId>>> {
-    let mut result = Vec::new();
+) -> Option<CollectionSources> {
+    let mut result = CollectionSources::default();
     for argument in arguments {
         match argument {
             PlaceOrSpread::Place(place) => {
-                result.push(FxHashSet::from_iter([place.identifier]));
+                result.values.insert(result.length, FxHashSet::from_iter([place.identifier]));
+                result.length = result.length.checked_add(1)?;
             }
             PlaceOrSpread::Spread(spread) => {
-                result.extend(resolve_collection_sources(
-                    spread.place.identifier,
-                    sources,
-                    properties,
-                )?);
+                let spread =
+                    resolve_collection_sources(spread.place.identifier, sources, properties)?;
+                for (index, values) in spread.values {
+                    let index = result.length.checked_add(index)?;
+                    result.values.entry(index).or_default().extend(values);
+                }
+                result.length = result.length.checked_add(spread.length)?;
             }
         }
     }
@@ -683,7 +692,8 @@ fn synchronously_called_declarations(
                 }
                 InstructionValue::ArrayExpression { elements, .. } => {
                     let mut values: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
-                    let mut index = 0;
+                    let mut index: usize = 0;
+                    let max_spread_index = usize::MAX - elements.len();
                     for element in elements {
                         match element {
                             ArrayElement::Place(place) => {
@@ -694,18 +704,31 @@ fn synchronously_called_declarations(
                                 index += 1;
                             }
                             ArrayElement::Spread(spread) => {
-                                if let Some(spread_values) = resolve_collection_sources(
+                                if let Some(spread) = resolve_collection_sources(
                                     spread.place.identifier,
                                     &sources,
                                     &properties,
                                 ) {
-                                    for sources in spread_values {
+                                    for (spread_index, sources) in spread.values {
+                                        let Some(spread_index) = index.checked_add(spread_index)
+                                        else {
+                                            values.entry(None).or_default().extend(sources);
+                                            continue;
+                                        };
                                         values
-                                            .entry(Some(index.to_string()))
+                                            .entry(Some(spread_index.to_string()))
                                             .or_default()
                                             .extend(sources);
-                                        index += 1;
                                     }
+                                    let Some(next_index) = index.checked_add(spread.length) else {
+                                        values.entry(None).or_default();
+                                        break;
+                                    };
+                                    if next_index > max_spread_index {
+                                        values.entry(None).or_default();
+                                        break;
+                                    }
+                                    index = next_index;
                                 } else {
                                     values.entry(None).or_default().extend(
                                         resolve_property_sources(
@@ -794,6 +817,15 @@ fn synchronously_called_declarations(
                 }
                 _ => None,
             };
+
+            if fallback_method.as_ref().is_some_and(|name| name == "bind")
+                && let InstructionValue::MethodCall { receiver, .. } = &instr.value
+            {
+                // `bind` returns a callable for its receiver without invoking it. Preserve that
+                // source so a later synchronous call to the bound result reaches the receiver.
+                sources.entry(into).or_default().insert(receiver.identifier);
+            }
+
             match &instr.value {
                 InstructionValue::CallExpression { callee, .. }
                 | InstructionValue::NewExpression { callee, .. } => {
@@ -855,16 +887,17 @@ fn synchronously_called_declarations(
                     None => None,
                 };
                 if let Some(arguments) = arguments {
-                    let argument_declarations: Vec<_> = arguments
+                    let argument_declarations: FxHashMap<_, _> = arguments
+                        .values
                         .iter()
-                        .map(|arguments| {
+                        .map(|(&index, arguments)| {
                             let mut values = FxHashSet::default();
                             for &argument in arguments {
                                 values.extend(resolve_called_declarations(
                                     env, argument, &sources, &bindings,
                                 ));
                             }
-                            values
+                            (index, values)
                         })
                         .collect();
                     let target = function_bindings.entry(called_function).or_default();
@@ -874,14 +907,14 @@ fn synchronously_called_declarations(
                         let (parameter, values) = match parameter {
                             ParamPattern::Place(place) => (
                                 place.identifier,
-                                argument_declarations.get(index).cloned().unwrap_or_default(),
+                                argument_declarations.get(&index).cloned().unwrap_or_default(),
                             ),
                             ParamPattern::Spread(spread) => (
                                 spread.place.identifier,
                                 argument_declarations
                                     .iter()
-                                    .skip(index)
-                                    .flatten()
+                                    .filter(|(argument_index, _)| **argument_index >= index)
+                                    .flat_map(|(_, values)| values)
                                     .copied()
                                     .collect(),
                             ),

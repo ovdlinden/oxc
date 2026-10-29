@@ -15,6 +15,7 @@ OxcDiagnostic { inner: OxcDiagnosticInner { message: "Cannot call impure functio
 OxcDiagnostic { inner: OxcDiagnosticInner { message: "Cannot call impure function during render", labels: [LabeledSpan { label: Some("Cannot call impure function"), span: Span { start: 3764, end: 3774 }, primary: true }], help: Some("`Date.now` is an impure function. Calling an impure function can produce unstable results that update unpredictably when the component re-renders"), note: Some("React Compiler skipped optimizing this component or hook"), severity: Error, code: OxcCode { scope: Some("react-compiler"), number: Some("Purity") }, url: Some("https://react.dev/reference/eslint-plugin-react-hooks/lints/purity") } }
 OxcDiagnostic { inner: OxcDiagnosticInner { message: "Cannot call impure function during render", labels: [LabeledSpan { label: Some("Cannot call impure function"), span: Span { start: 3943, end: 3953 }, primary: true }], help: Some("`Date.now` is an impure function. Calling an impure function can produce unstable results that update unpredictably when the component re-renders"), note: Some("React Compiler skipped optimizing this component or hook"), severity: Error, code: OxcCode { scope: Some("react-compiler"), number: Some("Purity") }, url: Some("https://react.dev/reference/eslint-plugin-react-hooks/lints/purity") } }
 OxcDiagnostic { inner: OxcDiagnosticInner { message: "Cannot call impure function during render", labels: [LabeledSpan { label: Some("Cannot call impure function"), span: Span { start: 4190, end: 4200 }, primary: true }], help: Some("`Date.now` is an impure function. Calling an impure function can produce unstable results that update unpredictably when the component re-renders"), note: Some("React Compiler skipped optimizing this component or hook"), severity: Error, code: OxcCode { scope: Some("react-compiler"), number: Some("Purity") }, url: Some("https://react.dev/reference/eslint-plugin-react-hooks/lints/purity") } }
+OxcDiagnostic { inner: OxcDiagnosticInner { message: "Cannot call impure function during render", labels: [LabeledSpan { label: Some("Cannot call impure function"), span: Span { start: 4412, end: 4422 }, primary: true }], help: Some("`Date.now` is an impure function. Calling an impure function can produce unstable results that update unpredictably when the component re-renders"), note: Some("React Compiler skipped optimizing this component or hook"), severity: Error, code: OxcCode { scope: Some("react-compiler"), number: Some("Purity") }, url: Some("https://react.dev/reference/eslint-plugin-react-hooks/lints/purity") } }
 
 // @validateNoImpureFunctionsInRender @outputMode:"lint" @compilationMode:"infer" @panicThreshold:"none"
 const ITEMS = [{ id: "a" }, { id: "b" }];
@@ -129,6 +130,18 @@ export function HelperCalledThroughObjectProperty({ items }) {
 	const getTime = () => Date.now();
 	return <div>{items.map(() => ({ getTime }).getTime())}</div>;
 }
+// Calling a bound function invokes the original captured helper.
+export function HelperCalledThroughBind({ items }) {
+	const getTime = () => Date.now();
+	return <div>{items.map(() => getTime.bind(null)())}</div>;
+}
+// Sparse array-like objects must not allocate through their largest property key.
+export function SparseApplyArgumentsDoNotAllocate({ items }) {
+	const getTime = () => Date.now();
+	return <div>
+      {items.map(() => ((call) => 1).apply(null, { "18446744073709551615": getTime }))}
+    </div>;
+}
 // Forwarding inside an event handler still does not execute during render.
 export function HelpersForwardedOnlyInEventHandler({ items }) {
 	const getTime = () => Date.now();
@@ -136,6 +149,7 @@ export function HelpersForwardedOnlyInEventHandler({ items }) {
       {items.map((item) => <button key={item.id} onClick={() => {
 		((call) => call())(...[getTime]);
 		({ getTime }).getTime();
+		getTime.bind(null)();
 	}} />)}
     </div>;
 }
