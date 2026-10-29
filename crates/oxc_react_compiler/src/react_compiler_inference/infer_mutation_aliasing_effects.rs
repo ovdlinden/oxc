@@ -55,6 +55,7 @@ use crate::react_compiler_hir::Type;
 use crate::react_compiler_hir::environment::Environment;
 use crate::react_compiler_hir::is_jsx_type;
 use crate::react_compiler_hir::is_primitive_type;
+use crate::react_compiler_hir::is_ref_or_ref_like_mutable_type;
 use crate::react_compiler_hir::is_ref_or_ref_value;
 use crate::react_compiler_hir::object_shape::BUILT_IN_ARRAY_ID;
 use crate::react_compiler_hir::object_shape::BUILT_IN_MAP_ID;
@@ -595,7 +596,7 @@ impl InferenceState {
         usage_span: Option<Span>,
     ) -> MutationResult {
         let ty = &env.types[env.identifiers[place_id].type_];
-        if is_ref_or_ref_value(ty) {
+        if is_ref_or_ref_like_value(ty) {
             return MutationResult::MutateRef;
         }
         let kind = self.kind_with_span(place_id, usage_span).kind;
@@ -1152,7 +1153,7 @@ fn find_non_mutated_destructure_spreads(
                 | InstructionValue::TaggedTemplateExpression { tag: callee, .. } => {
                     let callee_ty = &env.types[env.identifiers[callee.identifier].type_];
                     if get_hook_kind_for_type(env, callee_ty).ok().flatten().is_some() {
-                        if !is_ref_or_ref_value_for_id(env, lvalue_id) {
+                        if !is_ref_or_ref_like_value_for_id(env, lvalue_id) {
                             known_frozen.insert(lvalue_id);
                         }
                     } else if !candidate_non_mutating_spreads.is_empty() {
@@ -1662,7 +1663,7 @@ fn apply_effect_ref<'a>(
             let captures_ref = inner_func
                 .context
                 .iter()
-                .any(|operand| is_ref_or_ref_value_for_id(env, operand.identifier));
+                .any(|operand| is_ref_or_ref_like_value_for_id(env, operand.identifier));
 
             let is_mutable = has_captures || has_tracked_side_effects || captures_ref;
 
@@ -3270,9 +3271,16 @@ fn is_builtin_collection_type(ty: &Type) -> bool {
     )
 }
 
-fn is_ref_or_ref_value_for_id(env: &Environment, id: IdentifierId) -> bool {
+fn is_ref_or_ref_like_value(ty: &Type) -> bool {
+    // Unlike the TS implementation, also treat custom ref-like mutable types as refs during
+    // inference. In particular, freezing a Reanimated shared value before an inferred mutation
+    // causes valid writes from memoized callbacks to be reported as immutable.
+    is_ref_or_ref_value(ty) || is_ref_or_ref_like_mutable_type(ty)
+}
+
+fn is_ref_or_ref_like_value_for_id(env: &Environment, id: IdentifierId) -> bool {
     let ty = &env.types[env.identifiers[id].type_];
-    is_ref_or_ref_value(ty)
+    is_ref_or_ref_like_value(ty)
 }
 
 fn get_hook_kind_for_type<'a>(

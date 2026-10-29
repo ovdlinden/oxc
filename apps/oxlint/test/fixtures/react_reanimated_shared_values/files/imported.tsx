@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useCallback, useEffect } from "react";
 import { Gesture } from "react-native-gesture-handler";
 import { useSharedValue, withSpring, withTiming } from "react-native-reanimated";
 
@@ -22,6 +22,13 @@ export function useFadeIn(visible: boolean) {
     opacity.value = withTiming(visible ? 1 : 0);
   }, [opacity, visible]);
   return opacity;
+}
+
+export function useSharedValueCallback() {
+  const progress = useSharedValue(0);
+  return useCallback(() => {
+    progress.value = 1;
+  }, [progress]);
 }
 
 export function useDrag() {

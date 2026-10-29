@@ -1,5 +1,6 @@
 // @enableCustomTypeDefinitionForReanimated
 import {useSharedValue} from 'react-native-reanimated';
+import {useCallback} from 'react';
 
 /**
  * https://docs.swmansion.com/react-native-reanimated/docs/2.x/api/hooks/useSharedValue/
@@ -15,4 +16,11 @@ function SomeComponent() {
       title="Randomize"
     />
   );
+}
+
+function useSharedValueCallback() {
+  const progress = useSharedValue(0);
+  return useCallback(() => {
+    progress.value = 1;
+  }, [progress]);
 }
