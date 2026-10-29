@@ -29,9 +29,10 @@ use crate::react_compiler_hir::visitors::{
 };
 use crate::react_compiler_hir::{
     AliasingEffect, BlockId, DeclarationId, Effect, EvaluationOrder, FunctionId, HirFunction,
-    IdentifierId, InstructionValue, MutationReason, ParamPattern, Place, Terminal, Type,
-    is_jsx_type, is_primitive_type,
+    IdentifierId, InstructionValue, MutationReason, ParamPattern, Place, PlaceOrSpread,
+    PropertyLiteral, Terminal, Type, is_jsx_type, is_primitive_type,
 };
+use crate::react_compiler_validation::validate_locals_not_reassigned_after_render::no_alias_callback_parameters;
 use oxc_span::Span;
 
 // =============================================================================
@@ -445,6 +446,7 @@ fn directly_called_declarations(
 ) -> FxHashSet<DeclarationId> {
     let func = &env.functions[function_id];
     let mut sources: FxHashMap<IdentifierId, FxHashSet<IdentifierId>> = FxHashMap::default();
+    let mut method_names = FxHashMap::default();
     for (_, block) in &func.body.blocks {
         for phi in &block.phis {
             sources
@@ -457,6 +459,11 @@ fn directly_called_declarations(
     let mut called = Vec::new();
     for instr in &func.instructions {
         let into = instr.lvalue.identifier;
+        if let InstructionValue::PropertyLoad { property: PropertyLiteral::String(name), .. } =
+            &instr.value
+        {
+            method_names.insert(into, *name);
+        }
         match &instr.value {
             InstructionValue::LoadLocal { place, .. }
             | InstructionValue::LoadContext { place, .. }
@@ -478,6 +485,56 @@ fn directly_called_declarations(
             InstructionValue::MethodCall { property, .. } => called.push(property.identifier),
             InstructionValue::TaggedTemplateExpression { tag, .. } => called.push(tag.identifier),
             _ => {}
+        }
+        let args = match &instr.value {
+            InstructionValue::CallExpression { args, .. }
+            | InstructionValue::MethodCall { args, .. } => args,
+            _ => continue,
+        };
+        if !args.iter().any(|argument| {
+            let identifier = match argument {
+                PlaceOrSpread::Place(place) => place.identifier,
+                PlaceOrSpread::Spread(spread) => spread.place.identifier,
+            };
+            matches!(env.types[env.identifiers[identifier].type_], Type::Function { .. })
+        }) {
+            continue;
+        }
+        let fallback_method = match &instr.value {
+            InstructionValue::MethodCall { property, .. } => {
+                let mut pending = vec![property.identifier];
+                let mut seen = FxHashSet::default();
+                let mut name = None;
+                while let Some(current) = pending.pop() {
+                    if !seen.insert(current) {
+                        continue;
+                    }
+                    if let Some(&current) = method_names.get(&current) {
+                        if name.is_some_and(|name| name != current) {
+                            name = None;
+                            break;
+                        }
+                        name = Some(current);
+                    }
+                    pending.extend(sources.get(&current).into_iter().flatten().copied());
+                }
+                name
+            }
+            _ => None,
+        };
+        for index in no_alias_callback_parameters(
+            &instr.value,
+            env,
+            fallback_method.as_ref().map(|name| name.as_str()),
+            false,
+            args.len(),
+        ) {
+            if let Some(argument) = args.get(index) {
+                called.push(match argument {
+                    PlaceOrSpread::Place(place) => place.identifier,
+                    PlaceOrSpread::Spread(spread) => spread.place.identifier,
+                });
+            }
         }
     }
 

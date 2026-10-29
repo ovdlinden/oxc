@@ -108,3 +108,9 @@ export function HelperCalledWithApplyFromMapCallback() {
   }
   return <div>{ITEMS.map(() => getTime.apply(null, []))}</div>;
 }
+
+// Synchronous callback consumers invoke captured helpers during render too.
+export function HelperPassedToNestedMap({ items }) {
+  const getTime = () => Date.now();
+  return <div>{items.map(() => [1].map(getTime))}</div>;
+}

@@ -213,7 +213,7 @@ fn each_reassigning_operand(
 /// Callback operands excluded by a no-alias signature. Mutations performed by
 /// these callbacks are synchronous, but a value returned from one can still
 /// contain an escaping closure.
-pub(super) fn no_alias_callback_parameters(
+pub(crate) fn no_alias_callback_parameters(
     value: &InstructionValue<'_>,
     env: &Environment<'_>,
     fallback_method: Option<&str>,

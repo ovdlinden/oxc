@@ -19,6 +19,8 @@ use crate::react_compiler_hir::{
 type Captures = FxHashMap<IdentifierId, FxHashSet<IdentifierId>>;
 type Properties = FxHashMap<Option<String>, Values>;
 
+const MAX_SUBSTITUTION_RECURSION_DEPTH: usize = 128;
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Projection {
     object: IdentifierId,
@@ -594,6 +596,76 @@ impl Values {
     }
 }
 
+#[derive(Clone)]
+struct SubstitutionScope {
+    returned: Rc<ReturnedCallables>,
+    substitutions: FxHashMap<IdentifierId, Values>,
+    rest_arguments: FxHashMap<IdentifierId, Properties>,
+}
+
+enum DeferredInput {
+    Callee(IdentifierId),
+    Argument { key: Option<String>, value: IdentifierId },
+}
+
+#[derive(Clone, Copy)]
+enum CallableValues {
+    Context,
+    Iterator,
+}
+
+enum CaptureValueResolution {
+    Immediate(FxHashSet<IdentifierId>),
+    Resolve(IdentifierId),
+}
+
+struct CaptureResolution {
+    values: CallableValues,
+    callable: IdentifierId,
+    binding: IdentifierId,
+    sources: Vec<CaptureValueResolution>,
+}
+
+enum ResolutionAction {
+    Identifier {
+        id: IdentifierId,
+        scope: Rc<SubstitutionScope>,
+    },
+    Values {
+        original: Values,
+        scope: Rc<SubstitutionScope>,
+    },
+    Returned {
+        callable: Callable,
+        arguments: Arguments,
+    },
+    FinishProjection {
+        id: IdentifierId,
+        scope: Rc<SubstitutionScope>,
+        sources: Vec<Projection>,
+        child_count: usize,
+    },
+    FinishDeferredInputs {
+        id: IdentifierId,
+        call: DeferredCall,
+        inputs: Vec<DeferredInput>,
+    },
+    FinishDeferredCall {
+        id: IdentifierId,
+        child_count: usize,
+    },
+    FinishValueIdentities {
+        original: Values,
+        scope: Rc<SubstitutionScope>,
+        identities: Vec<IdentifierId>,
+    },
+    FinishValueCaptures {
+        values: Values,
+        captures: Vec<CaptureResolution>,
+        child_count: usize,
+    },
+}
+
 #[derive(Clone, Default, PartialEq, Eq)]
 struct PendingCapture {
     roots: FxHashSet<IdentifierId>,
@@ -776,13 +848,19 @@ impl CallableState {
         if let Some(arguments) = arguments
             && let Some(summary) = &callable.returned
         {
-            let (substitutions, rest) = self.call_substitutions(&callable, summary, arguments);
+            let (substitutions, rest_arguments) =
+                self.call_substitutions(&callable, summary, arguments);
+            let scope = Rc::new(SubstitutionScope {
+                returned: Rc::clone(summary),
+                substitutions,
+                rest_arguments,
+            });
             for (&binding, sources) in &summary.parameter_values {
                 let mut flattened_rest = false;
                 let identities = sources
                     .iter()
                     .flat_map(|&source| {
-                        if let Some(elements) = rest.get(&source) {
+                        if let Some(elements) = scope.rest_arguments.get(&source) {
                             flattened_rest = true;
                             let members = summary.capture_reads.get(&binding);
                             return elements
@@ -795,15 +873,10 @@ impl CallableState {
                                 .flat_map(|(_, values)| values.identities.iter().copied())
                                 .collect();
                         }
-                        self.substitute(
-                            source,
-                            &substitutions,
-                            &summary.projections,
-                            &summary.deferred_calls,
-                            &rest,
-                            &mut FxHashSet::default(),
+                        self.resolve_identifier(source, Rc::clone(&scope)).map_or_else(
+                            || FxHashSet::from_iter([source]),
+                            |values| values.identities,
                         )
-                        .map_or_else(|| FxHashSet::from_iter([source]), |values| values.identities)
                     })
                     .collect();
                 if flattened_rest {
@@ -813,12 +886,12 @@ impl CallableState {
             }
             for &(parameter, _) in &summary.params {
                 if !summary.parameter_values.contains_key(&parameter)
-                    && let Some(values) = substitutions.get(&parameter)
+                    && let Some(values) = scope.substitutions.get(&parameter)
                 {
                     Rc::make_mut(&mut callable.context_values)
                         .insert(parameter, values.identities.clone());
                 }
-                if let Some(elements) = rest.get(&parameter)
+                if let Some(elements) = scope.rest_arguments.get(&parameter)
                     && let Some(members) = summary.capture_members.get(&parameter)
                 {
                     let identities = members
@@ -901,30 +974,20 @@ impl CallableState {
                     summary,
                     call.arguments.as_ref().unwrap_or(&empty),
                 );
+                let scope = Rc::new(SubstitutionScope {
+                    returned: Rc::clone(summary),
+                    substitutions,
+                    rest_arguments: rest,
+                });
                 for nested in summary.calls.values().flatten() {
-                    let callees = self.substitute_values(
-                        &nested.callees,
-                        summary,
-                        &substitutions,
-                        &rest,
-                        &mut FxHashSet::default(),
-                    );
+                    let callees = self.substitute_values(&nested.callees, Rc::clone(&scope));
                     let arguments = nested.arguments.as_ref().map(|arguments| Arguments {
                         length: arguments.length,
                         elements: arguments
                             .elements
                             .iter()
                             .map(|(key, values)| {
-                                (
-                                    key.clone(),
-                                    self.substitute_values(
-                                        values,
-                                        summary,
-                                        &substitutions,
-                                        &rest,
-                                        &mut FxHashSet::default(),
-                                    ),
-                                )
+                                (key.clone(), self.substitute_values(values, Rc::clone(&scope)))
                             })
                             .collect(),
                     });
@@ -1327,47 +1390,346 @@ impl CallableState {
         result
     }
 
-    fn substitute(
+    /// Resolve returned callable values with an explicit continuation stack.
+    /// Helper chains are user-sized, so using the Rust call stack here can abort
+    /// the compiler before cycle detection has a chance to terminate the walk.
+    fn resolve_substitutions(
         &self,
-        id: IdentifierId,
-        substitutions: &FxHashMap<IdentifierId, Values>,
-        projections: &Projections,
-        deferred_calls: &DeferredCalls,
-        rest_arguments: &FxHashMap<IdentifierId, Properties>,
+        initial: ResolutionAction,
         visiting: &mut FxHashSet<IdentifierId>,
     ) -> Option<Values> {
-        if let Some(values) = substitutions.get(&id) {
+        let mut actions = vec![initial];
+        let mut results: Vec<Option<Values>> = Vec::new();
+
+        while let Some(action) = actions.pop() {
+            match action {
+                ResolutionAction::Identifier { id, scope } => {
+                    if let Some(values) = scope.substitutions.get(&id) {
+                        results.push(Some(values.clone()));
+                        continue;
+                    }
+                    if let Some(call) = scope.returned.deferred_calls.get(&id).cloned() {
+                        if !visiting.insert(id) {
+                            results.push(None);
+                            continue;
+                        }
+                        let mut inputs = Vec::new();
+                        inputs.extend(call.callees.iter().copied().map(DeferredInput::Callee));
+                        for (key, values) in &call.arguments.elements {
+                            inputs.extend(
+                                values.identities.iter().copied().map(|value| {
+                                    DeferredInput::Argument { key: key.clone(), value }
+                                }),
+                            );
+                        }
+                        let input_values: Vec<_> = inputs
+                            .iter()
+                            .map(|input| match input {
+                                DeferredInput::Callee(value)
+                                | DeferredInput::Argument { value, .. } => *value,
+                            })
+                            .collect();
+                        actions.push(ResolutionAction::FinishDeferredInputs { id, call, inputs });
+                        for id in input_values.into_iter().rev() {
+                            actions.push(ResolutionAction::Identifier {
+                                id,
+                                scope: Rc::clone(&scope),
+                            });
+                        }
+                        continue;
+                    }
+                    let Some(sources) = scope.returned.projections.get(&id) else {
+                        results.push(None);
+                        continue;
+                    };
+                    if sources.is_empty() || !visiting.insert(id) {
+                        results.push(None);
+                        continue;
+                    }
+                    let sources: Vec<_> = sources.iter().cloned().collect();
+                    let child_count = sources
+                        .iter()
+                        .filter(|source| !scope.rest_arguments.contains_key(&source.object))
+                        .count();
+                    actions.push(ResolutionAction::FinishProjection {
+                        id,
+                        scope: Rc::clone(&scope),
+                        sources: sources.clone(),
+                        child_count,
+                    });
+                    for source in sources.into_iter().rev() {
+                        if !scope.rest_arguments.contains_key(&source.object) {
+                            actions.push(ResolutionAction::Identifier {
+                                id: source.object,
+                                scope: Rc::clone(&scope),
+                            });
+                        }
+                    }
+                }
+                ResolutionAction::Values { original, scope } => {
+                    let identities: Vec<_> = original.identities.iter().copied().collect();
+                    actions.push(ResolutionAction::FinishValueIdentities {
+                        original,
+                        scope: Rc::clone(&scope),
+                        identities: identities.clone(),
+                    });
+                    for id in identities.into_iter().rev() {
+                        actions.push(ResolutionAction::Identifier { id, scope: Rc::clone(&scope) });
+                    }
+                }
+                ResolutionAction::Returned { callable, arguments } => {
+                    if callable.is_async {
+                        results.push(Some(Values::default()));
+                        continue;
+                    }
+                    let Some(returned) = callable.returned.as_ref() else {
+                        results.push(Some(Values::default()));
+                        continue;
+                    };
+                    let (substitutions, rest_arguments) =
+                        self.call_substitutions(&callable, returned, &arguments);
+                    actions.push(ResolutionAction::Values {
+                        original: returned.values.clone(),
+                        scope: Rc::new(SubstitutionScope {
+                            returned: Rc::clone(returned),
+                            substitutions,
+                            rest_arguments,
+                        }),
+                    });
+                }
+                ResolutionAction::FinishProjection { id, scope, sources, child_count } => {
+                    let child_results = results.split_off(results.len() - child_count);
+                    let mut child_results = child_results.into_iter();
+                    let mut resolved = Values::default();
+                    for source in sources {
+                        if let Some(elements) = scope.rest_arguments.get(&source.object) {
+                            if source.key.is_some() {
+                                if let Some(values) =
+                                    elements.get(&source.key).or_else(|| elements.get(&None))
+                                {
+                                    resolved.extend(values);
+                                }
+                            } else {
+                                for values in elements.values() {
+                                    resolved.extend(values);
+                                }
+                            }
+                        } else if let Some(objects) =
+                            child_results.next().expect("projection result")
+                        {
+                            resolved.extend(&self.project(&objects, &source.key));
+                        } else {
+                            resolved.identities.insert(id);
+                        }
+                    }
+                    visiting.remove(&id);
+                    results.push(Some(resolved));
+                }
+                ResolutionAction::FinishDeferredInputs { id, call, inputs } => {
+                    let child_results = results.split_off(results.len() - inputs.len());
+                    let mut callees = Values::default();
+                    let mut arguments = call.arguments;
+                    for (input, selected) in inputs.into_iter().zip(child_results) {
+                        match input {
+                            DeferredInput::Callee(callee) => {
+                                callees.extend(&selected.unwrap_or_else(|| self.values(callee)));
+                            }
+                            DeferredInput::Argument { key, value } => {
+                                if let Some(selected) = selected
+                                    && let Some(values) = arguments.elements.get_mut(&key)
+                                {
+                                    values.identities.remove(&value);
+                                    values.extend(&selected);
+                                }
+                            }
+                        }
+                    }
+                    let callables: Vec<_> = callees.contexts.values().cloned().collect();
+                    actions.push(ResolutionAction::FinishDeferredCall {
+                        id,
+                        child_count: callables.len(),
+                    });
+                    for callable in callables.into_iter().rev() {
+                        actions.push(ResolutionAction::Returned {
+                            callable,
+                            arguments: arguments.clone(),
+                        });
+                    }
+                }
+                ResolutionAction::FinishDeferredCall { id, child_count } => {
+                    let child_results = results.split_off(results.len() - child_count);
+                    let mut resolved = Values::default();
+                    for values in child_results.into_iter().flatten() {
+                        resolved.extend(&values);
+                    }
+                    if child_count == 0 {
+                        resolved.identities.insert(id);
+                    }
+                    visiting.remove(&id);
+                    results.push(Some(resolved));
+                }
+                ResolutionAction::FinishValueIdentities { original, scope, identities } => {
+                    let child_results = results.split_off(results.len() - identities.len());
+                    let mut values = original;
+                    for (identity, selected) in identities.into_iter().zip(child_results) {
+                        if let Some(selected) = selected {
+                            values.identities.remove(&identity);
+                            values.extend(&selected);
+                        }
+                    }
+                    let mut captures = Vec::new();
+                    let mut child_count = 0;
+                    for (callable_values, callables) in [
+                        (CallableValues::Context, &values.contexts),
+                        (CallableValues::Iterator, &values.iterators),
+                    ] {
+                        for (&callable, closure) in callables {
+                            for (&binding, captured) in closure.context_values.iter() {
+                                let sources = if scope.returned.external_contexts.contains(&binding)
+                                    && let Some(current) = scope.substitutions.get(&binding)
+                                {
+                                    vec![CaptureValueResolution::Immediate(
+                                        current.identities.clone(),
+                                    )]
+                                } else {
+                                    captured
+                                        .iter()
+                                        .map(|value| {
+                                            if let Some(elements) = scope.rest_arguments.get(value)
+                                                && let Some(members) =
+                                                    closure.capture_members.get(&binding)
+                                            {
+                                                return CaptureValueResolution::Immediate(
+                                                    members
+                                                        .iter()
+                                                        .filter(|member| {
+                                                            member.parse::<usize>().is_ok()
+                                                        })
+                                                        .flat_map(|member| {
+                                                            elements
+                                                                .get(&Some(member.clone()))
+                                                                .into_iter()
+                                                                .chain(elements.get(&None))
+                                                        })
+                                                        .flat_map(|value| {
+                                                            value.identities.iter().copied()
+                                                        })
+                                                        .collect(),
+                                                );
+                                            }
+                                            child_count += 1;
+                                            CaptureValueResolution::Resolve(*value)
+                                        })
+                                        .collect()
+                                };
+                                captures.push(CaptureResolution {
+                                    values: callable_values,
+                                    callable,
+                                    binding,
+                                    sources,
+                                });
+                            }
+                        }
+                    }
+                    actions.push(ResolutionAction::FinishValueCaptures {
+                        values,
+                        captures,
+                        child_count,
+                    });
+                    let ResolutionAction::FinishValueCaptures { captures, .. } =
+                        actions.last().expect("capture continuation")
+                    else {
+                        unreachable!();
+                    };
+                    let pending: Vec<_> = captures
+                        .iter()
+                        .flat_map(|capture| &capture.sources)
+                        .filter_map(|source| match source {
+                            CaptureValueResolution::Resolve(id) => Some(*id),
+                            CaptureValueResolution::Immediate(_) => None,
+                        })
+                        .collect();
+                    for id in pending.into_iter().rev() {
+                        actions.push(ResolutionAction::Identifier { id, scope: Rc::clone(&scope) });
+                    }
+                }
+                ResolutionAction::FinishValueCaptures { mut values, captures, child_count } => {
+                    let child_results = results.split_off(results.len() - child_count);
+                    let mut child_results = child_results.into_iter();
+                    for capture in captures {
+                        let mut resolved = FxHashSet::default();
+                        for source in capture.sources {
+                            match source {
+                                CaptureValueResolution::Immediate(values) => {
+                                    resolved.extend(values);
+                                }
+                                CaptureValueResolution::Resolve(id) => {
+                                    if let Some(values) =
+                                        child_results.next().expect("capture result")
+                                    {
+                                        resolved.extend(values.identities);
+                                    } else {
+                                        resolved.insert(id);
+                                    }
+                                }
+                            }
+                        }
+                        let callables = match capture.values {
+                            CallableValues::Context => &mut values.contexts,
+                            CallableValues::Iterator => &mut values.iterators,
+                        };
+                        if let Some(callable) = callables.get_mut(&capture.callable) {
+                            Rc::make_mut(&mut callable.context_values)
+                                .insert(capture.binding, resolved);
+                        }
+                    }
+                    results.push(Some(values));
+                }
+            }
+        }
+        debug_assert_eq!(results.len(), 1);
+        results.pop().flatten()
+    }
+
+    fn resolve_identifier(&self, id: IdentifierId, scope: Rc<SubstitutionScope>) -> Option<Values> {
+        self.substitute_recursive(id, &scope, &mut FxHashSet::default(), 0)
+    }
+
+    /// Keep the common shallow path allocation-free, then transfer to the
+    /// explicit continuation stack before recursion can scale with user input.
+    fn substitute_recursive(
+        &self,
+        id: IdentifierId,
+        scope: &Rc<SubstitutionScope>,
+        visiting: &mut FxHashSet<IdentifierId>,
+        depth: usize,
+    ) -> Option<Values> {
+        if depth == MAX_SUBSTITUTION_RECURSION_DEPTH {
+            return self.resolve_substitutions(
+                ResolutionAction::Identifier { id, scope: Rc::clone(scope) },
+                visiting,
+            );
+        }
+        if let Some(values) = scope.substitutions.get(&id) {
             return Some(values.clone());
         }
-        if let Some(call) = deferred_calls.get(&id) {
+        if let Some(call) = scope.returned.deferred_calls.get(&id) {
             if !visiting.insert(id) {
                 return None;
             }
             let mut callees = Values::default();
             for &callee in &call.callees {
                 let selected = self
-                    .substitute(
-                        callee,
-                        substitutions,
-                        projections,
-                        deferred_calls,
-                        rest_arguments,
-                        visiting,
-                    )
+                    .substitute_recursive(callee, scope, visiting, depth + 1)
                     .unwrap_or_else(|| self.values(callee));
                 callees.extend(&selected);
             }
             let mut arguments = call.arguments.clone();
             for values in arguments.elements.values_mut() {
                 for value in values.identities.clone() {
-                    if let Some(selected) = self.substitute(
-                        value,
-                        substitutions,
-                        projections,
-                        deferred_calls,
-                        rest_arguments,
-                        visiting,
-                    ) {
+                    if let Some(selected) =
+                        self.substitute_recursive(value, scope, visiting, depth + 1)
+                    {
                         values.identities.remove(&value);
                         values.extend(&selected);
                     }
@@ -1375,7 +1737,12 @@ impl CallableState {
             }
             let mut result = Values::default();
             for callable in callees.contexts.values() {
-                result.extend(&self.returned_values(callable, &arguments, visiting));
+                result.extend(&self.returned_values_recursive(
+                    callable,
+                    &arguments,
+                    visiting,
+                    depth + 1,
+                ));
             }
             if callees.contexts.is_empty() {
                 result.identities.insert(id);
@@ -1383,13 +1750,13 @@ impl CallableState {
             visiting.remove(&id);
             return Some(result);
         }
-        let sources = projections.get(&id)?;
+        let sources = scope.returned.projections.get(&id)?;
         if sources.is_empty() || !visiting.insert(id) {
             return None;
         }
         let mut result = Values::default();
         for source in sources {
-            if let Some(elements) = rest_arguments.get(&source.object) {
+            if let Some(elements) = scope.rest_arguments.get(&source.object) {
                 if source.key.is_some() {
                     if let Some(values) = elements.get(&source.key).or_else(|| elements.get(&None))
                     {
@@ -1402,14 +1769,9 @@ impl CallableState {
                 }
                 continue;
             }
-            if let Some(objects) = self.substitute(
-                source.object,
-                substitutions,
-                projections,
-                deferred_calls,
-                rest_arguments,
-                visiting,
-            ) {
+            if let Some(objects) =
+                self.substitute_recursive(source.object, scope, visiting, depth + 1)
+            {
                 result.extend(&self.project(&objects, &source.key));
             } else {
                 result.identities.insert(id);
@@ -1561,7 +1923,7 @@ impl CallableState {
                 result.extend(&iterator);
                 continue;
             }
-            result.extend(&self.returned_values(callable, &arguments, &mut FxHashSet::default()));
+            result.extend(&self.returned_values(callable, &arguments));
         }
         let callees: FxHashSet<_> = invoked
             .identities
@@ -1578,65 +1940,92 @@ impl CallableState {
         self.values.insert(instruction.lvalue.identifier, result);
     }
 
-    fn returned_values(
+    fn returned_values(&self, callable: &Callable, arguments: &Arguments) -> Values {
+        self.returned_values_recursive(callable, arguments, &mut FxHashSet::default(), 0)
+    }
+
+    fn returned_values_recursive(
         &self,
         callable: &Callable,
         arguments: &Arguments,
         visiting: &mut FxHashSet<IdentifierId>,
+        depth: usize,
     ) -> Values {
         // Async calls produce promises, not the eventual returned callable.
         if callable.is_async {
             return Values::default();
         }
-        let Some(returned) = &callable.returned else {
+        let Some(returned) = callable.returned.as_ref() else {
             return Values::default();
         };
+        if depth == MAX_SUBSTITUTION_RECURSION_DEPTH {
+            return self
+                .resolve_substitutions(
+                    ResolutionAction::Returned {
+                        callable: callable.clone(),
+                        arguments: arguments.clone(),
+                    },
+                    visiting,
+                )
+                .unwrap_or_default();
+        }
         let (substitutions, rest_arguments) =
             self.call_substitutions(callable, returned, arguments);
-        self.substitute_values(
+        self.substitute_values_recursive(
             &returned.values,
-            returned,
-            &substitutions,
-            &rest_arguments,
+            &Rc::new(SubstitutionScope {
+                returned: Rc::clone(returned),
+                substitutions,
+                rest_arguments,
+            }),
             visiting,
+            depth + 1,
         )
     }
 
-    fn substitute_values(
+    fn substitute_values(&self, original: &Values, scope: Rc<SubstitutionScope>) -> Values {
+        self.substitute_values_recursive(original, &scope, &mut FxHashSet::default(), 0)
+    }
+
+    fn substitute_values_recursive(
         &self,
         original: &Values,
-        returned: &ReturnedCallables,
-        substitutions: &FxHashMap<IdentifierId, Values>,
-        rest_arguments: &FxHashMap<IdentifierId, Properties>,
+        scope: &Rc<SubstitutionScope>,
         visiting: &mut FxHashSet<IdentifierId>,
+        depth: usize,
     ) -> Values {
+        if depth == MAX_SUBSTITUTION_RECURSION_DEPTH {
+            return self
+                .resolve_substitutions(
+                    ResolutionAction::Values {
+                        original: original.clone(),
+                        scope: Rc::clone(scope),
+                    },
+                    visiting,
+                )
+                .unwrap_or_default();
+        }
         let mut values = original.clone();
         // Returning a parameter snapshots the selected callable; a newly
         // returned closure retains the caller's live binding information.
         for identity in &original.identities {
-            if let Some(selected) = self.substitute(
-                *identity,
-                substitutions,
-                &returned.projections,
-                &returned.deferred_calls,
-                rest_arguments,
-                visiting,
-            ) {
+            if let Some(selected) = self.substitute_recursive(*identity, scope, visiting, depth + 1)
+            {
                 values.identities.remove(identity);
                 values.extend(&selected);
             }
         }
         for closure in values.contexts.values_mut().chain(values.iterators.values_mut()) {
             for (&binding, values) in Rc::make_mut(&mut closure.context_values).iter_mut() {
-                if returned.external_contexts.contains(&binding)
-                    && let Some(current) = substitutions.get(&binding)
+                if scope.returned.external_contexts.contains(&binding)
+                    && let Some(current) = scope.substitutions.get(&binding)
                 {
                     *values = current.identities.clone();
                 } else {
                     *values = values
                         .iter()
                         .flat_map(|value| {
-                            if let Some(elements) = rest_arguments.get(value)
+                            if let Some(elements) = scope.rest_arguments.get(value)
                                 && let Some(members) = closure.capture_members.get(&binding)
                             {
                                 return members
@@ -1651,18 +2040,11 @@ impl CallableState {
                                     .flat_map(|value| value.identities.iter().copied())
                                     .collect();
                             }
-                            self.substitute(
-                                *value,
-                                substitutions,
-                                &returned.projections,
-                                &returned.deferred_calls,
-                                rest_arguments,
-                                visiting,
-                            )
-                            .map_or_else(
-                                || FxHashSet::from_iter([*value]),
-                                |values| values.identities,
-                            )
+                            self.substitute_recursive(*value, scope, visiting, depth + 1)
+                                .map_or_else(
+                                    || FxHashSet::from_iter([*value]),
+                                    |values| values.identities,
+                                )
                         })
                         .collect();
                 }
