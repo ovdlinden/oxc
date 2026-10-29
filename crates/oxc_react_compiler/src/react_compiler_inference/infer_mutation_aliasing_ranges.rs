@@ -119,6 +119,7 @@ struct AliasingState {
     nodes: FxHashMap<IdentifierId, Node>,
     called_declarations: FxHashMap<FunctionId, FxHashSet<DeclarationId>>,
     function_declarations: Option<FxHashMap<DeclarationId, FunctionId>>,
+    function_returns: FxHashMap<FunctionId, FxHashSet<DeclarationId>>,
 }
 
 impl AliasingState {
@@ -127,6 +128,7 @@ impl AliasingState {
             nodes: FxHashMap::default(),
             called_declarations: FxHashMap::default(),
             function_declarations: None,
+            function_returns: FxHashMap::default(),
         }
     }
 
@@ -433,6 +435,7 @@ impl AliasingState {
                                         env,
                                         function_id,
                                         function_declarations,
+                                        &mut self.function_returns,
                                     )
                                 })
                                 .contains(&env.identifiers[*capture].declaration_id)
@@ -452,6 +455,10 @@ impl AliasingState {
 
 type ParameterBindings = FxHashMap<DeclarationId, FxHashSet<DeclarationId>>;
 type PropertySources = FxHashMap<IdentifierId, FxHashMap<Option<String>, FxHashSet<IdentifierId>>>;
+
+// Wider collections lose exact positions and flow through the unknown-property bucket instead of
+// expanding shared spreads exponentially.
+const MAX_TRACKED_ARGUMENTS: usize = 256;
 
 /// Sparse argument slots and their inferred array-like length.
 ///
@@ -506,6 +513,9 @@ fn resolve_collection_sources(
             found = true;
             for (key, values) in values {
                 let index: usize = key.as_ref()?.parse().ok()?;
+                if index >= MAX_TRACKED_ARGUMENTS {
+                    return None;
+                }
                 result.length = result.length.max(index.checked_add(1)?);
                 result.values.entry(index).or_default().extend(values);
             }
@@ -527,6 +537,9 @@ fn resolve_call_arguments(
     for argument in arguments {
         match argument {
             PlaceOrSpread::Place(place) => {
+                if result.length >= MAX_TRACKED_ARGUMENTS {
+                    return None;
+                }
                 result.values.insert(result.length, FxHashSet::from_iter([place.identifier]));
                 result.length = result.length.checked_add(1)?;
             }
@@ -535,13 +548,34 @@ fn resolve_call_arguments(
                     resolve_collection_sources(spread.place.identifier, sources, properties)?;
                 for (index, values) in spread.values {
                     let index = result.length.checked_add(index)?;
+                    if index >= MAX_TRACKED_ARGUMENTS {
+                        return None;
+                    }
                     result.values.entry(index).or_default().extend(values);
                 }
                 result.length = result.length.checked_add(spread.length)?;
+                if result.length > MAX_TRACKED_ARGUMENTS {
+                    return None;
+                }
             }
         }
     }
     Some(result)
+}
+
+fn append_collection_sources(
+    mut prefix: CollectionSources,
+    suffix: CollectionSources,
+) -> Option<CollectionSources> {
+    for (index, values) in suffix.values {
+        let index = prefix.length.checked_add(index)?;
+        if index >= MAX_TRACKED_ARGUMENTS {
+            return None;
+        }
+        prefix.values.entry(index).or_default().extend(values);
+    }
+    prefix.length = prefix.length.checked_add(suffix.length)?;
+    (prefix.length <= MAX_TRACKED_ARGUMENTS).then_some(prefix)
 }
 
 fn collect_function_declarations(env: &Environment) -> FxHashMap<DeclarationId, FunctionId> {
@@ -560,6 +594,88 @@ fn collect_function_declarations(env: &Environment) -> FxHashMap<DeclarationId, 
         }
     }
     declarations
+}
+
+fn collect_function_returns(
+    env: &Environment,
+    function_id: FunctionId,
+) -> FxHashSet<DeclarationId> {
+    let func = &env.functions[function_id];
+    let mut sources: FxHashMap<IdentifierId, FxHashSet<IdentifierId>> = FxHashMap::default();
+    for (_, block) in &func.body.blocks {
+        for phi in &block.phis {
+            sources
+                .entry(phi.place.identifier)
+                .or_default()
+                .extend(phi.operands.values().map(|operand| operand.identifier));
+        }
+    }
+    for instr in &func.instructions {
+        let into = instr.lvalue.identifier;
+        match &instr.value {
+            InstructionValue::LoadLocal { place, .. }
+            | InstructionValue::LoadContext { place, .. }
+            | InstructionValue::TypeCastExpression { value: place, .. } => {
+                sources.entry(into).or_default().insert(place.identifier);
+            }
+            InstructionValue::StoreLocal { lvalue, value, .. }
+            | InstructionValue::StoreContext { lvalue, value, .. } => {
+                sources.entry(lvalue.place.identifier).or_default().insert(value.identifier);
+                sources.entry(into).or_default().insert(value.identifier);
+            }
+            _ => {}
+        }
+    }
+
+    let mut returned = FxHashSet::default();
+    for (_, block) in &func.body.blocks {
+        if let Terminal::Return { value, .. } = &block.terminal {
+            let mut pending = vec![value.identifier];
+            let mut seen = FxHashSet::default();
+            while let Some(identifier) = pending.pop() {
+                if !seen.insert(identifier) {
+                    continue;
+                }
+                returned.insert(env.identifiers[identifier].declaration_id);
+                pending.extend(sources.get(&identifier).into_iter().flatten().copied());
+            }
+        }
+    }
+    returned
+}
+
+fn resolve_bound_arguments(
+    identifier: IdentifierId,
+    sources: &FxHashMap<IdentifierId, FxHashSet<IdentifierId>>,
+    bound_arguments: &FxHashMap<IdentifierId, Vec<PlaceOrSpread>>,
+) -> Option<Vec<PlaceOrSpread>> {
+    let mut pending = vec![identifier];
+    let mut seen = FxHashSet::default();
+    while let Some(current) = pending.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+        if let Some(arguments) = bound_arguments.get(&current) {
+            return Some(arguments.clone());
+        }
+        pending.extend(sources.get(&current).into_iter().flatten().copied());
+    }
+    None
+}
+
+fn resolve_declaration_sources(
+    initial: &FxHashSet<DeclarationId>,
+    bindings: &ParameterBindings,
+) -> FxHashSet<DeclarationId> {
+    let mut result = FxHashSet::default();
+    let mut pending: Vec<_> = initial.iter().copied().collect();
+    while let Some(declaration) = pending.pop() {
+        if !result.insert(declaration) {
+            continue;
+        }
+        pending.extend(bindings.get(&declaration).into_iter().flatten().copied());
+    }
+    result
 }
 
 fn resolve_called_declarations(
@@ -599,6 +715,7 @@ fn synchronously_called_declarations(
     env: &Environment,
     function_id: FunctionId,
     function_declarations: &FxHashMap<DeclarationId, FunctionId>,
+    function_returns: &mut FxHashMap<FunctionId, FxHashSet<DeclarationId>>,
 ) -> FxHashSet<DeclarationId> {
     enum CalledArguments {
         Direct(Vec<PlaceOrSpread>),
@@ -608,6 +725,7 @@ fn synchronously_called_declarations(
     struct Called {
         callee: IdentifierId,
         arguments: Option<CalledArguments>,
+        into: Option<IdentifierId>,
     }
 
     let argument_identifier = |argument: &PlaceOrSpread| match argument {
@@ -621,7 +739,7 @@ fn synchronously_called_declarations(
     let mut analyzed_bindings: FxHashMap<FunctionId, ParameterBindings> = FxHashMap::default();
 
     while let Some(function_id) = pending_functions.pop() {
-        let bindings = function_bindings.get(&function_id).cloned().unwrap_or_default();
+        let mut bindings = function_bindings.get(&function_id).cloned().unwrap_or_default();
         if analyzed_bindings.get(&function_id) == Some(&bindings) {
             continue;
         }
@@ -632,6 +750,7 @@ fn synchronously_called_declarations(
         let mut properties = PropertySources::default();
         let mut property_loads = Vec::new();
         let mut method_names = FxHashMap::default();
+        let mut bound_arguments = FxHashMap::default();
         for (_, block) in &func.body.blocks {
             for phi in &block.phis {
                 sources
@@ -697,6 +816,10 @@ fn synchronously_called_declarations(
                     for element in elements {
                         match element {
                             ArrayElement::Place(place) => {
+                                if index >= MAX_TRACKED_ARGUMENTS {
+                                    values.entry(None).or_default().insert(place.identifier);
+                                    continue;
+                                }
                                 values
                                     .entry(Some(index.to_string()))
                                     .or_default()
@@ -715,6 +838,10 @@ fn synchronously_called_declarations(
                                             values.entry(None).or_default().extend(sources);
                                             continue;
                                         };
+                                        if spread_index >= MAX_TRACKED_ARGUMENTS {
+                                            values.entry(None).or_default().extend(sources);
+                                            continue;
+                                        }
                                         values
                                             .entry(Some(spread_index.to_string()))
                                             .or_default()
@@ -724,7 +851,9 @@ fn synchronously_called_declarations(
                                         values.entry(None).or_default();
                                         break;
                                     };
-                                    if next_index > max_spread_index {
+                                    if next_index > max_spread_index
+                                        || next_index > MAX_TRACKED_ARGUMENTS
+                                    {
                                         values.entry(None).or_default();
                                         break;
                                     }
@@ -819,23 +948,32 @@ fn synchronously_called_declarations(
             };
 
             if fallback_method.as_ref().is_some_and(|name| name == "bind")
-                && let InstructionValue::MethodCall { receiver, .. } = &instr.value
+                && let InstructionValue::MethodCall { receiver, args, .. } = &instr.value
             {
                 // `bind` returns a callable for its receiver without invoking it. Preserve that
                 // source so a later synchronous call to the bound result reaches the receiver.
                 sources.entry(into).or_default().insert(receiver.identifier);
+                bound_arguments.insert(into, args.iter().skip(1).copied().collect());
             }
 
             match &instr.value {
                 InstructionValue::CallExpression { callee, .. }
                 | InstructionValue::NewExpression { callee, .. } => {
-                    called.push(Called { callee: callee.identifier, arguments });
+                    called.push(Called { callee: callee.identifier, arguments, into: Some(into) });
                 }
                 InstructionValue::MethodCall { property, .. } => {
-                    called.push(Called { callee: property.identifier, arguments });
+                    called.push(Called {
+                        callee: property.identifier,
+                        arguments,
+                        into: Some(into),
+                    });
                 }
                 InstructionValue::TaggedTemplateExpression { tag, .. } => {
-                    called.push(Called { callee: tag.identifier, arguments: None });
+                    called.push(Called {
+                        callee: tag.identifier,
+                        arguments: None,
+                        into: Some(into),
+                    });
                 }
                 _ => {}
             }
@@ -859,7 +997,11 @@ fn synchronously_called_declarations(
                 args.len(),
             ) {
                 if let Some(argument) = args.get(index) {
-                    called.push(Called { callee: argument_identifier(argument), arguments: None });
+                    called.push(Called {
+                        callee: argument_identifier(argument),
+                        arguments: None,
+                        into: None,
+                    });
                 }
             }
         }
@@ -879,10 +1021,30 @@ fn synchronously_called_declarations(
                 let mut changed = false;
                 let arguments = match &call.arguments {
                     Some(CalledArguments::Direct(arguments)) => {
-                        resolve_call_arguments(arguments, &sources, &properties)
+                        let mut arguments = arguments.clone();
+                        if let Some(mut bound) =
+                            resolve_bound_arguments(call.callee, &sources, &bound_arguments)
+                        {
+                            bound.append(&mut arguments);
+                            arguments = bound;
+                        }
+                        resolve_call_arguments(&arguments, &sources, &properties)
                     }
                     Some(CalledArguments::Apply(arguments)) => {
-                        resolve_collection_sources(*arguments, &sources, &properties)
+                        if let Some(bound) =
+                            resolve_bound_arguments(call.callee, &sources, &bound_arguments)
+                        {
+                            resolve_call_arguments(&bound, &sources, &properties).and_then(
+                                |bound| {
+                                    resolve_collection_sources(*arguments, &sources, &properties)
+                                        .and_then(|applied| {
+                                            append_collection_sources(bound, applied)
+                                        })
+                                },
+                            )
+                        } else {
+                            resolve_collection_sources(*arguments, &sources, &properties)
+                        }
                     }
                     None => None,
                 };
@@ -925,6 +1087,19 @@ fn synchronously_called_declarations(
                         into.extend(values);
                         changed |= into.len() != old_len;
                     }
+                }
+                if let Some(into) = call.into {
+                    let returned = function_returns
+                        .entry(called_function)
+                        .or_insert_with(|| collect_function_returns(env, called_function));
+                    let returned = function_bindings.get(&called_function).map_or_else(
+                        || returned.clone(),
+                        |bindings| resolve_declaration_sources(returned, bindings),
+                    );
+                    bindings
+                        .entry(env.identifiers[into].declaration_id)
+                        .or_default()
+                        .extend(returned);
                 }
                 if changed || !analyzed_bindings.contains_key(&called_function) {
                     pending_functions.push(called_function);

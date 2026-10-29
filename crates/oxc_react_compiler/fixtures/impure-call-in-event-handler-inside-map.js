@@ -182,3 +182,48 @@ export function HelpersForwardedOnlyInEventHandler({ items }) {
     </div>
   );
 }
+
+// Bound wrapper arguments execute when the bound wrapper is called during render.
+export function HelperForwardedThroughBind({ items }) {
+  const getTime = () => Date.now();
+  return <div>{items.map(() => ((call) => call()).bind(null, getTime)())}</div>;
+}
+
+// A helper returned by a synchronous wrapper is still called during render.
+export function HelperReturnedThroughIife({ items }) {
+  const getTime = () => Date.now();
+  return <div>{items.map(() => (() => getTime)()())}</div>;
+}
+
+// Repeated shared spreads must widen instead of expanding exponentially.
+export function SharedArraySpreadsConverge({ items }) {
+  const getTime = () => Date.now();
+  return items.map(() => {
+    const a0 = [getTime];
+    const a1 = [...a0, ...a0];
+    const a2 = [...a1, ...a1];
+    const a3 = [...a2, ...a2];
+    const a4 = [...a3, ...a3];
+    const a5 = [...a4, ...a4];
+    const a6 = [...a5, ...a5];
+    const a7 = [...a6, ...a6];
+    const a8 = [...a7, ...a7];
+    const a9 = [...a8, ...a8];
+    const a10 = [...a9, ...a9];
+    const a11 = [...a10, ...a10];
+    const a12 = [...a11, ...a11];
+    const a13 = [...a12, ...a12];
+    const a14 = [...a13, ...a13];
+    const a15 = [...a14, ...a14];
+    const a16 = [...a15, ...a15];
+    const a17 = [...a16, ...a16];
+    const a18 = [...a17, ...a17];
+    const a19 = [...a18, ...a18];
+    const a20 = [...a19, ...a19];
+    const a21 = [...a20, ...a20];
+    const a22 = [...a21, ...a21];
+    const a23 = [...a22, ...a22];
+    const a24 = [...a23, ...a23];
+    return ((call) => 1)(...a24);
+  });
+}
