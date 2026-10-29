@@ -20,6 +20,7 @@ type Captures = FxHashMap<IdentifierId, FxHashSet<IdentifierId>>;
 type Properties = FxHashMap<Option<String>, Values>;
 
 const MAX_SUBSTITUTION_RECURSION_DEPTH: usize = 128;
+const MAX_CALL_RECURSION_DEPTH: usize = 128;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Projection {
@@ -947,6 +948,23 @@ impl CallableState {
         resolved: &mut Vec<ResolvedCall>,
         invocations: &mut Vec<AsyncInvocation>,
     ) {
+        self.execute_call_recursive(call, visiting, resolved, invocations, 0);
+    }
+
+    /// Unlike the TS implementation, keep the common shallow path allocation-free,
+    /// then transfer to an explicit worklist before recursion can scale with user input.
+    fn execute_call_recursive(
+        &mut self,
+        call: &Call,
+        visiting: &mut FxHashSet<IdentifierId>,
+        resolved: &mut Vec<ResolvedCall>,
+        invocations: &mut Vec<AsyncInvocation>,
+        depth: usize,
+    ) {
+        if depth == MAX_CALL_RECURSION_DEPTH {
+            self.execute_call_worklist(call.clone(), visiting, resolved, invocations);
+            return;
+        }
         for (&id, callable) in &call.callees.contexts {
             if callable.generator || !visiting.insert(id) {
                 continue;
@@ -991,15 +1009,111 @@ impl CallableState {
                             })
                             .collect(),
                     });
-                    self.execute_call(
+                    self.execute_call_recursive(
                         &Call { callees, arguments },
                         visiting,
                         resolved,
                         invocations,
+                        depth + 1,
                     );
                 }
             }
             visiting.remove(&id);
+        }
+    }
+
+    fn execute_call_worklist(
+        &mut self,
+        call: Call,
+        visiting: &mut FxHashSet<IdentifierId>,
+        resolved: &mut Vec<ResolvedCall>,
+        invocations: &mut Vec<AsyncInvocation>,
+    ) {
+        enum Action {
+            Call(Call),
+            Callable { id: IdentifierId, callable: Callable, arguments: Rc<Option<Arguments>> },
+            Finish(IdentifierId),
+        }
+
+        let mut actions = vec![Action::Call(call)];
+        while let Some(action) = actions.pop() {
+            match action {
+                Action::Call(call) => {
+                    let arguments = Rc::new(call.arguments);
+                    let callees: Vec<_> = call.callees.contexts.into_iter().collect();
+                    for (id, callable) in callees.into_iter().rev() {
+                        actions.push(Action::Callable {
+                            id,
+                            callable,
+                            arguments: Rc::clone(&arguments),
+                        });
+                    }
+                }
+                Action::Callable { id, callable, arguments } => {
+                    if callable.generator || !visiting.insert(id) {
+                        continue;
+                    }
+                    let resolved_call = ResolvedCall {
+                        callable: id,
+                        context_values: Rc::clone(&callable.context_values),
+                        bound_arguments: callable.bound_arguments.clone(),
+                        arguments: arguments.as_ref().clone(),
+                    };
+                    if resolved.iter().any(|current| current == &resolved_call) {
+                        visiting.remove(&id);
+                        continue;
+                    }
+                    resolved.push(resolved_call);
+                    if callable.is_async {
+                        invocations.push(self.invocation(callable, arguments.as_ref().as_ref()));
+                        visiting.remove(&id);
+                        continue;
+                    }
+                    let Some(summary) = callable.returned.as_ref() else {
+                        visiting.remove(&id);
+                        continue;
+                    };
+                    actions.push(Action::Finish(id));
+                    let empty = Arguments::default();
+                    let (substitutions, rest_arguments) = self.call_substitutions(
+                        &callable,
+                        summary,
+                        arguments.as_ref().as_ref().unwrap_or(&empty),
+                    );
+                    let scope = Rc::new(SubstitutionScope {
+                        returned: Rc::clone(summary),
+                        substitutions,
+                        rest_arguments,
+                    });
+                    let nested_calls: Vec<_> = summary
+                        .calls
+                        .values()
+                        .flatten()
+                        .map(|nested| Call {
+                            callees: self.substitute_values(&nested.callees, Rc::clone(&scope)),
+                            arguments: nested.arguments.as_ref().map(|arguments| Arguments {
+                                length: arguments.length,
+                                elements: arguments
+                                    .elements
+                                    .iter()
+                                    .map(|(key, values)| {
+                                        (
+                                            key.clone(),
+                                            self.substitute_values(values, Rc::clone(&scope)),
+                                        )
+                                    })
+                                    .collect(),
+                            }),
+                        })
+                        .collect();
+                    for nested in nested_calls.into_iter().rev() {
+                        actions.push(Action::Call(nested));
+                    }
+                }
+                Action::Finish(id) => {
+                    visiting.remove(&id);
+                }
+            }
         }
     }
 

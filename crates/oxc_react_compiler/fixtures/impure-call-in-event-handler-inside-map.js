@@ -114,3 +114,9 @@ export function HelperPassedToNestedMap({ items }) {
   const getTime = () => Date.now();
   return <div>{items.map(() => [1].map(getTime))}</div>;
 }
+
+// Synchronously invoked local wrappers preserve their captured call effects.
+export function HelperCalledThroughIife({ items }) {
+  const getTime = () => Date.now();
+  return <div>{items.map(() => (() => getTime())())}</div>;
+}
