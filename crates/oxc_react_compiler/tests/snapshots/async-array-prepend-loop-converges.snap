@@ -1,0 +1,30 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/async-array-prepend-loop-converges.js
+---
+import { c as _c } from "react/compiler-runtime";
+function Component(t0) {
+	const $ = _c(4);
+	const { items } = t0;
+	let count = 0;
+	let values;
+	if ($[0] !== items) {
+		values = [];
+		for (const item of items) {
+			values = [item, ...values];
+		}
+		$[0] = items;
+		$[1] = values;
+	} else {
+		values = $[1];
+	}
+	let t1;
+	if ($[2] !== values.length) {
+		t1 = <div>{values.length}</div>;
+		$[2] = values.length;
+		$[3] = t1;
+	} else {
+		t1 = $[3];
+	}
+	return t1;
+}

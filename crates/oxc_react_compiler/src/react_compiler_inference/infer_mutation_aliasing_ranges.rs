@@ -434,33 +434,66 @@ impl AliasingState {
     }
 }
 
-/// Declarations that `function_id` calls directly. A call's callee is the temporary
-/// that loads the binding, so resolve it through `LoadLocal`/`LoadContext`.
+/// Declarations that `function_id` calls directly.
+///
+/// Unlike the TS implementation, the Oxc-only render-purity refinement distinguishes
+/// captured callbacks that are invoked from callbacks that merely escape. Resolve
+/// local aliases and `Function.prototype.call`/`apply` before making that distinction.
 fn directly_called_declarations(
     env: &Environment,
     function_id: FunctionId,
 ) -> FxHashSet<DeclarationId> {
-    let instructions = &env.functions[function_id].instructions;
-    let loaded: FxHashMap<IdentifierId, IdentifierId> = instructions
-        .iter()
-        .filter_map(|instr| match &instr.value {
+    let func = &env.functions[function_id];
+    let mut sources: FxHashMap<IdentifierId, FxHashSet<IdentifierId>> = FxHashMap::default();
+    for (_, block) in &func.body.blocks {
+        for phi in &block.phis {
+            sources
+                .entry(phi.place.identifier)
+                .or_default()
+                .extend(phi.operands.values().map(|operand| operand.identifier));
+        }
+    }
+
+    let mut called = Vec::new();
+    for instr in &func.instructions {
+        let into = instr.lvalue.identifier;
+        match &instr.value {
             InstructionValue::LoadLocal { place, .. }
-            | InstructionValue::LoadContext { place, .. } => {
-                Some((instr.lvalue.identifier, place.identifier))
+            | InstructionValue::LoadContext { place, .. }
+            | InstructionValue::TypeCastExpression { value: place, .. } => {
+                sources.entry(into).or_default().insert(place.identifier);
             }
-            _ => None,
-        })
-        .collect();
-    instructions
-        .iter()
-        .filter_map(|instr| match &instr.value {
-            InstructionValue::CallExpression { callee, .. } => {
-                let callee = loaded.get(&callee.identifier).copied().unwrap_or(callee.identifier);
-                Some(env.identifiers[callee].declaration_id)
+            InstructionValue::StoreLocal { lvalue, value, .. }
+            | InstructionValue::StoreContext { lvalue, value, .. } => {
+                sources.entry(lvalue.place.identifier).or_default().insert(value.identifier);
+                sources.entry(into).or_default().insert(value.identifier);
             }
-            _ => None,
-        })
-        .collect()
+            InstructionValue::PropertyLoad { object, property, .. }
+                if property.is_string("call") || property.is_string("apply") =>
+            {
+                sources.entry(into).or_default().insert(object.identifier);
+            }
+            InstructionValue::CallExpression { callee, .. }
+            | InstructionValue::NewExpression { callee, .. } => called.push(callee.identifier),
+            InstructionValue::MethodCall { property, .. } => called.push(property.identifier),
+            InstructionValue::TaggedTemplateExpression { tag, .. } => called.push(tag.identifier),
+            _ => {}
+        }
+    }
+
+    let mut declarations = FxHashSet::default();
+    for callee in called {
+        let mut pending = vec![callee];
+        let mut seen = FxHashSet::default();
+        while let Some(current) = pending.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            declarations.insert(env.identifiers[current].declaration_id);
+            pending.extend(sources.get(&current).into_iter().flatten().copied());
+        }
+    }
+    declarations
 }
 
 // =============================================================================

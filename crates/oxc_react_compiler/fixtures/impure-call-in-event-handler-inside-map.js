@@ -78,3 +78,33 @@ export function HelperCalledFromMapCallback() {
   }
   return <div>{ITEMS.map((item) => getTime())}</div>;
 }
+
+// Calling a captured helper through a local alias still runs it during render.
+export function AliasedHelperCalledFromMapCallback() {
+  function getTime() {
+    return Date.now();
+  }
+  return (
+    <div>
+      {ITEMS.map(() => {
+        const read = getTime;
+        return read();
+      })}
+    </div>
+  );
+}
+
+// Function.prototype.call and apply invoke their receiver during render too.
+export function HelperCalledWithCallFromMapCallback() {
+  function getTime() {
+    return Date.now();
+  }
+  return <div>{ITEMS.map(() => getTime.call(null))}</div>;
+}
+
+export function HelperCalledWithApplyFromMapCallback() {
+  function getTime() {
+    return Date.now();
+  }
+  return <div>{ITEMS.map(() => getTime.apply(null, []))}</div>;
+}

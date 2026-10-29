@@ -44,9 +44,16 @@ impl Default for Arguments {
 impl Arguments {
     fn append(&mut self, other: &Self) {
         for (key, values) in &other.elements {
-            let key = self.length.and_then(|offset| {
-                key.as_ref()?.parse::<usize>().ok()?.checked_add(offset).map(|i| i.to_string())
-            });
+            // Unlike the TS implementation, widen elements from an unknown-length
+            // spread. Keeping their relative numeric indices makes prepend loops
+            // create a new property on every fixed-point iteration.
+            let key = if other.length.is_some() {
+                self.length.and_then(|offset| {
+                    key.as_ref()?.parse::<usize>().ok()?.checked_add(offset).map(|i| i.to_string())
+                })
+            } else {
+                None
+            };
             self.elements.entry(key).or_default().extend(values);
         }
         self.length = self.length.zip(other.length).and_then(|(a, b)| a.checked_add(b));
@@ -98,6 +105,16 @@ type DeferredCalls = FxHashMap<IdentifierId, DeferredCall>;
 #[derive(Clone, PartialEq, Eq)]
 struct Call {
     callees: Values,
+    arguments: Option<Arguments>,
+}
+
+/// A resolved callable summary and the live values supplied at this call site.
+/// The same state can be reached through multiple branches of a helper graph.
+#[derive(PartialEq, Eq)]
+struct ResolvedCall {
+    callable: IdentifierId,
+    context_values: Rc<Captures>,
+    bound_arguments: Arguments,
     arguments: Option<Arguments>,
 }
 
@@ -854,12 +871,27 @@ impl CallableState {
         &mut self,
         call: &Call,
         visiting: &mut FxHashSet<IdentifierId>,
+        resolved: &mut Vec<ResolvedCall>,
         invocations: &mut Vec<AsyncInvocation>,
     ) {
         for (&id, callable) in &call.callees.contexts {
             if callable.generator || !visiting.insert(id) {
                 continue;
             }
+            // Unlike the TS implementation, avoid expanding a shared callable
+            // summary once per control-flow path. Its effects are idempotent for
+            // equal contexts and arguments, while repeated expansion is exponential.
+            let resolved_call = ResolvedCall {
+                callable: id,
+                context_values: Rc::clone(&callable.context_values),
+                bound_arguments: callable.bound_arguments.clone(),
+                arguments: call.arguments.clone(),
+            };
+            if resolved.iter().any(|current| current == &resolved_call) {
+                visiting.remove(&id);
+                continue;
+            }
+            resolved.push(resolved_call);
             if callable.is_async {
                 invocations.push(self.invocation(callable.clone(), call.arguments.as_ref()));
             } else if let Some(summary) = &callable.returned {
@@ -896,7 +928,12 @@ impl CallableState {
                             })
                             .collect(),
                     });
-                    self.execute_call(&Call { callees, arguments }, visiting, invocations);
+                    self.execute_call(
+                        &Call { callees, arguments },
+                        visiting,
+                        resolved,
+                        invocations,
+                    );
                 }
             }
             visiting.remove(&id);
@@ -2072,8 +2109,14 @@ pub(super) fn infer_async_callable_contexts(
                         })
                 })
                 .collect();
+                let mut resolved = Vec::new();
                 for call in &calls {
-                    state.execute_call(call, &mut FxHashSet::default(), &mut invocations);
+                    state.execute_call(
+                        call,
+                        &mut FxHashSet::default(),
+                        &mut resolved,
+                        &mut invocations,
+                    );
                 }
                 if calls.is_empty() {
                     result.returned.calls.remove(&instruction_id);
